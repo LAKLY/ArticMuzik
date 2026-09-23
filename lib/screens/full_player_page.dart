@@ -32,18 +32,20 @@ class _FullPlayerPageState extends State<FullPlayerPage>
   Color _dominantColor = ArticTheme.accent;
   CancelToken? _colorCancelToken;
 
-  // Подписки
   StreamSubscription<MediaItem?>? _mediaItemSubscription;
   StreamSubscription<PlaybackState>? _playbackStateSubscription;
-  // Подписка на позицию удалена – теперь используется StreamBuilder
 
   LoopMode _loopMode = LoopMode.off;
+  bool _isShuffle = false;
   bool _showLyrics = false;
   String? _lyrics;
   bool _isLiked = false;
   bool _isPlaying = false;
   bool _flashVisible = false;
   bool _isDisposed = false;
+
+  Timer? _sleepTimer;
+  DateTime? _sleepUntil;
 
   @override
   void initState() {
@@ -67,6 +69,7 @@ class _FullPlayerPageState extends State<FullPlayerPage>
 
     _loadLikeStatusAsync();
     _loadLoopMode();
+    _isShuffle = audioHandler.shuffleEnabled;
 
     _mediaItemSubscription = audioHandler.mediaItem.listen((mediaItem) {
       if (_isDisposed || mediaItem == null) return;
@@ -89,8 +92,6 @@ class _FullPlayerPageState extends State<FullPlayerPage>
         setState(() => _isPlaying = state.playing);
       }
     });
-
-    // Подписка на positionStream удалена – теперь используется StreamBuilder в _TerminalSliderWithStream
   }
 
   @override
@@ -101,6 +102,7 @@ class _FullPlayerPageState extends State<FullPlayerPage>
     _gridController.dispose();
     _glitchController.dispose();
     _colorCancelToken?.cancel();
+    _sleepTimer?.cancel();
     super.dispose();
   }
 
@@ -152,6 +154,119 @@ class _FullPlayerPageState extends State<FullPlayerPage>
     audioHandler.setLoopMode(_loopMode);
   }
 
+  void _toggleShuffle() async {
+    if (_isDisposed) return;
+    final newValue = !audioHandler.shuffleEnabled;
+    await audioHandler.setShuffleEnabled(newValue);
+    if (!_isDisposed && mounted) {
+      setState(() => _isShuffle = newValue);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(newValue ? 'Перемешивание включено' : 'Перемешивание выключено'),
+          duration: const Duration(seconds: 1),
+        ),
+      );
+    }
+  }
+
+  // ---------- SLEEP TIMER ----------
+
+  void _showSleepTimerMenu() {
+    final active = _sleepTimer != null;
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: ArticTheme.backgroundDarkest,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(
+                active ? 'Таймер сна активен' : 'Таймер сна',
+                style: TextStyle(
+                  color: ArticTheme.primary,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+            if (active)
+              ListTile(
+                leading: Icon(Icons.timer_off,
+                    color: ArticTheme.accent, size: 22),
+                title: Text('Выключить таймер',
+                    style: TextStyle(color: ArticTheme.primary)),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _cancelSleepTimer();
+                },
+              ),
+            _sleepTile(ctx, '15 минут', 15),
+            _sleepTile(ctx, '30 минут', 30),
+            _sleepTile(ctx, '60 минут', 60),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _sleepTile(BuildContext ctx, String label, int minutes) {
+    return ListTile(
+      leading: Icon(Icons.bedtime_outlined,
+          color: ArticTheme.accent, size: 22),
+      title: Text(label, style: TextStyle(color: ArticTheme.primary)),
+      onTap: () {
+        Navigator.pop(ctx);
+        _setSleepTimer(minutes);
+      },
+    );
+  }
+
+  void _setSleepTimer(int minutes) {
+    _sleepTimer?.cancel();
+    _sleepUntil = DateTime.now().add(Duration(minutes: minutes));
+    _sleepTimer = Timer(Duration(minutes: minutes), () {
+      audioHandler.pause();
+      if (mounted) {
+        setState(() {
+          _sleepTimer = null;
+          _sleepUntil = null;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Таймер сна: воспроизведение остановлено')),
+        );
+      }
+    });
+    if (mounted) {
+      setState(() {});
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Таймер сна: $minutes мин'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    }
+  }
+
+  void _cancelSleepTimer() {
+    _sleepTimer?.cancel();
+    _sleepTimer = null;
+    _sleepUntil = null;
+    if (mounted) {
+      setState(() {});
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Таймер сна выключен')),
+      );
+    }
+  }
+
+  // ---------- LIKE / LYRICS / COLOR ----------
+
   void _toggleLike() async {
     if (_isDisposed) return;
     final trackId = _currentMediaItem?.extras?['trackId'] as String?;
@@ -171,7 +286,9 @@ class _FullPlayerPageState extends State<FullPlayerPage>
     if (success && !_isDisposed && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(_isLiked ? 'Добавлено в избранное' : 'Удалено из избранного'),
+          content: Text(_isLiked
+              ? 'Добавлено в избранное'
+              : 'Удалено из избранного'),
           duration: const Duration(seconds: 2),
         ),
       );
@@ -248,7 +365,8 @@ class _FullPlayerPageState extends State<FullPlayerPage>
             _DynamicGradient(dominantColor: _dominantColor),
             AnimatedSwitcher(
               duration: const Duration(milliseconds: 350),
-              transitionBuilder: (child, animation) => FadeTransition(opacity: animation, child: child),
+              transitionBuilder: (child, animation) =>
+                  FadeTransition(opacity: animation, child: child),
               child: (_showLyrics && _lyrics != null && _lyrics!.isNotEmpty)
                   ? _LyricsView(
                       key: ValueKey('lyrics_$trackId'),
@@ -262,7 +380,8 @@ class _FullPlayerPageState extends State<FullPlayerPage>
                       artist: artist,
                       coverUrl: coverUrl,
                       isPlaying: _isPlaying,
-                      onSeek: (val) => audioHandler.seek(Duration(seconds: val.toInt())),
+                      onSeek: (val) =>
+                          audioHandler.seek(Duration(seconds: val.toInt())),
                       onPlayPause: audioHandler.playOrPause,
                       onPrevious: audioHandler.skipToPrevious,
                       onNext: audioHandler.skipToNext,
@@ -303,9 +422,19 @@ class _FullPlayerPageState extends State<FullPlayerPage>
           onPressed: _toggleLike,
         ),
         _NeonIconButton(
+          icon: _isShuffle ? Icons.shuffle_on : Icons.shuffle,
+          color: _isShuffle ? ArticTheme.accent : ArticTheme.primary,
+          onPressed: _toggleShuffle,
+        ),
+        _NeonIconButton(
           icon: _loopIcon(),
           color: ArticTheme.primary,
           onPressed: _toggleLoopMode,
+        ),
+        _NeonIconButton(
+          icon: Icons.bedtime_outlined,
+          color: _sleepTimer != null ? ArticTheme.accent : ArticTheme.primary,
+          onPressed: _showSleepTimerMenu,
         ),
         _NeonIconButton(
           icon: Icons.queue_music,
@@ -323,6 +452,11 @@ class _FullPlayerPageState extends State<FullPlayerPage>
 }
 
 // ============ WIDGETS ============
+// (все виджеты ниже — без изменений; _AnimatedGrid, _DynamicGradient,
+//  _PlayerContent, _MonospaceText, _GlitchCover, _NeonCoverImage,
+//  _SpectrumAnalyzer, _TerminalSliderWithStream, _TerminalSlider,
+//  _ControlButtons, _GeometricButton, _TerminalInfo, _TerminalBadge,
+//  _LyricsView, _NeonIconButton)
 
 class _AnimatedGrid extends StatelessWidget {
   final AnimationController controller;
@@ -364,7 +498,8 @@ class _GridPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant _GridPainter oldDelegate) => oldDelegate.shift != shift;
+  bool shouldRepaint(covariant _GridPainter oldDelegate) =>
+      oldDelegate.shift != shift;
 }
 
 class _DynamicGradient extends StatelessWidget {
@@ -466,7 +601,11 @@ class _MonospaceText extends StatelessWidget {
   final String title;
   final String artist;
   final bool isPlaying;
-  const _MonospaceText({required this.title, required this.artist, required this.isPlaying});
+  const _MonospaceText({
+    required this.title,
+    required this.artist,
+    required this.isPlaying,
+  });
 
   String _truncate(String text, int maxLength) {
     if (text.length <= maxLength) return text;
@@ -480,14 +619,18 @@ class _MonospaceText extends StatelessWidget {
 
     return AnimatedSwitcher(
       duration: const Duration(milliseconds: 300),
-      transitionBuilder: (child, animation) => FadeTransition(opacity: animation, child: child),
+      transitionBuilder: (child, animation) =>
+          FadeTransition(opacity: animation, child: child),
       child: Column(
         key: ValueKey('${truncatedTitle}_$truncatedArtist'),
         children: [
           Animate(
             effects: const [
               FadeEffect(duration: Duration(milliseconds: 300)),
-              ScaleEffect(begin: Offset(0.98, 0.98), end: Offset(1, 1), curve: Curves.easeOut)
+              ScaleEffect(
+                  begin: Offset(0.98, 0.98),
+                  end: Offset(1, 1),
+                  curve: Curves.easeOut)
             ],
             child: Text(
               truncatedTitle.toUpperCase(),
@@ -542,7 +685,8 @@ class _GlitchCover extends StatelessWidget {
                   child: _NeonCoverImage(
                     coverUrl: coverUrl,
                     opacity: 0.4,
-                    colorFilter: const ColorFilter.mode(Colors.red, BlendMode.modulate),
+                    colorFilter:
+                        const ColorFilter.mode(Colors.red, BlendMode.modulate),
                     isPlaying: isPlaying,
                   ),
                 ),
@@ -558,7 +702,8 @@ class _GlitchCover extends StatelessWidget {
                   child: _NeonCoverImage(
                     coverUrl: coverUrl,
                     opacity: 0.4,
-                    colorFilter: const ColorFilter.mode(Colors.blue, BlendMode.modulate),
+                    colorFilter: const ColorFilter.mode(
+                        Colors.blue, BlendMode.modulate),
                     isPlaying: isPlaying,
                   ),
                 ),
@@ -620,7 +765,10 @@ class _NeonCoverImage extends StatelessWidget {
                 decoration: BoxDecoration(
                   borderRadius: BorderRadius.circular(24),
                   gradient: RadialGradient(
-                    colors: [Colors.transparent, ArticTheme.accent.withValues(alpha: 0.3)],
+                    colors: [
+                      Colors.transparent,
+                      ArticTheme.accent.withValues(alpha: 0.3)
+                    ],
                     radius: 0.8,
                   ),
                 ),
@@ -707,7 +855,6 @@ class __SpectrumAnalyzerState extends State<_SpectrumAnalyzer>
   }
 }
 
-// ---- Новый виджет для слайдера с StreamBuilder ----
 class _TerminalSliderWithStream extends StatelessWidget {
   final Function(double) onSeek;
 
@@ -771,7 +918,9 @@ class _TerminalSlider extends StatelessWidget {
               thumbColor: ArticTheme.primary,
             ),
             child: Slider(
-              value: currentPosition.inSeconds.toDouble().clamp(0.0, safeMax > 0 ? safeMax : 1.0),
+              value: currentPosition.inSeconds
+                  .toDouble()
+                  .clamp(0.0, safeMax > 0 ? safeMax : 1.0),
               min: 0,
               max: safeMax > 0 ? safeMax : 1.0,
               onChanged: (val) => onSeek(val),
@@ -784,12 +933,14 @@ class _TerminalSlider extends StatelessWidget {
               children: [
                 Text(
                   _formatTime(currentPosition),
-                  style: const TextStyle(fontFamily: 'StieglitzSP', fontSize: 12)
+                  style: const TextStyle(
+                          fontFamily: 'StieglitzSP', fontSize: 12)
                       .copyWith(color: ArticTheme.secondary),
                 ),
                 Text(
                   _formatTime(duration),
-                  style: const TextStyle(fontFamily: 'StieglitzSP', fontSize: 12)
+                  style: const TextStyle(
+                          fontFamily: 'StieglitzSP', fontSize: 12)
                       .copyWith(color: ArticTheme.secondary),
                 ),
               ],
@@ -861,14 +1012,17 @@ class _GeometricButton extends StatelessWidget {
         tween: Tween(begin: 1.0, end: 1.0),
         duration: const Duration(milliseconds: 120),
         curve: Curves.elasticOut,
-        builder: (context, scale, child) => Transform.scale(scale: scale, child: child),
+        builder: (context, scale, child) =>
+            Transform.scale(scale: scale, child: child),
         child: Container(
           width: size,
           height: size,
           decoration: BoxDecoration(
             shape: BoxShape.circle,
             color: isPrimary ? ArticTheme.accent : Colors.transparent,
-            border: isPrimary ? null : Border.all(color: ArticTheme.accent, width: 1.5),
+            border: isPrimary
+                ? null
+                : Border.all(color: ArticTheme.accent, width: 1.5),
             boxShadow: isPrimary ? ArticTheme.glow() : null,
           ),
           child: Icon(icon, color: ArticTheme.primary, size: size * 0.5),
@@ -958,7 +1112,8 @@ class _LyricsView extends StatelessWidget {
             const SizedBox(height: 20),
             Text(
               title,
-              style: const TextStyle(fontFamily: 'StieglitzSP', fontSize: 18)
+              style: const TextStyle(
+                      fontFamily: 'StieglitzSP', fontSize: 18)
                   .copyWith(color: ArticTheme.primary),
             ),
             const SizedBox(height: 20),
@@ -1003,11 +1158,12 @@ class _NeonIconButton extends StatelessWidget {
       tween: Tween(begin: 1.0, end: 1.0),
       duration: const Duration(milliseconds: 150),
       curve: Curves.elasticOut,
-      builder: (context, scale, child) => Transform.scale(scale: scale, child: child),
+      builder: (context, scale, child) =>
+          Transform.scale(scale: scale, child: child),
       child: IconButton(
         icon: Icon(icon, color: color),
         onPressed: onPressed,
-        splashRadius: 24,
+        splashRadius: 22,
       ),
     );
   }
