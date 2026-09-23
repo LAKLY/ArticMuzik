@@ -23,6 +23,18 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
 
   StreamSubscription<PlayerState>? _playerStateSub;
   StreamSubscription<Duration?>? _durationSub;
+  StreamSubscription<Duration>? _positionFadeSub;
+
+  // ---------- Crossfade ----------
+  int _crossfadeSeconds = 0;
+  Timer? _fadeTimer;
+  bool _isFading = false;
+
+  final StreamController<String> _playbackErrorsController =
+      StreamController<String>.broadcast();
+  Stream<String> get playbackErrors => _playbackErrorsController.stream;
+
+  Future<String?> Function(String trackId)? resolveTrackUrl;
 
   void Function(MediaItem current, String? nextTrackId)? onTrackStarted;
 
@@ -33,8 +45,11 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
   Future<void> get ready => _readyCompleter.future;
   bool get isInitialized => _isInitialized;
   Set<String> get brokenTrackIds => Set.unmodifiable(_brokenTrackIds);
+  bool get shuffleEnabled => _player.shuffleModeEnabled;
+  int get crossfadeSeconds => _crossfadeSeconds;
 
   AppAudioHandler({required SharedPreferences prefs}) : _prefs = prefs {
+    _crossfadeSeconds = _prefs.getInt('crossfade_seconds') ?? 0;
     _setupListeners();
   }
 
@@ -79,7 +94,77 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
       queue.value[idx] = updated;
       mediaItem.add(updated);
     });
+
+    // Позиция — для crossfade.
+    _positionFadeSub = _player.positionStream.listen(_checkCrossfade);
   }
+
+  // ---------- Crossfade ----------
+
+  void _checkCrossfade(Duration position) {
+    if (_crossfadeSeconds <= 0) return;
+    if (_isFading) return;
+    if (!_player.playing) return;
+
+    final duration = _player.duration;
+    if (duration == null || duration.inMilliseconds <= 0) return;
+
+    final remainingMs = duration.inMilliseconds - position.inMilliseconds;
+    if (remainingMs <= 0) return;
+
+    final fadeMs = _crossfadeSeconds * 1000;
+    if (remainingMs <= fadeMs) {
+      _startFadeOut(Duration(milliseconds: remainingMs));
+    }
+  }
+
+  void _startFadeOut(Duration remaining) {
+    if (_isFading) return;
+    _isFading = true;
+
+    const steps = 24;
+    final stepMs = (remaining.inMilliseconds / steps).clamp(15, 200).toInt();
+    var step = 0;
+
+    _fadeTimer?.cancel();
+    _fadeTimer = Timer.periodic(Duration(milliseconds: stepMs), (t) {
+      if (_disposed || !_isFading) {
+        t.cancel();
+        return;
+      }
+      step++;
+      final v = (1.0 - step / steps).clamp(0.0, 1.0);
+      _safeSetVolume(v);
+      if (step >= steps) {
+        t.cancel();
+      }
+    });
+  }
+
+  void _resetVolume() {
+    _fadeTimer?.cancel();
+    _fadeTimer = null;
+    _isFading = false;
+    _safeSetVolume(1.0);
+  }
+
+  void _safeSetVolume(double v) {
+    try {
+      _player.setVolume(v);
+    } catch (e) {
+      debugPrint('setVolume error: $e');
+    }
+  }
+
+  Future<void> setCrossfadeSeconds(int seconds) async {
+    final clamped = seconds.clamp(0, 5);
+    if (_crossfadeSeconds == clamped) return;
+    _crossfadeSeconds = clamped;
+    await _prefs.setInt('crossfade_seconds', clamped);
+    if (clamped == 0) _resetVolume();
+  }
+
+  // ---------- Треки ----------
 
   Future<void> _handleTrackCompleted() async {
     if (_lastSwitchAt != null &&
@@ -90,8 +175,9 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
 
     if (_player.loopMode == LoopMode.one) {
       try {
+        _resetVolume();
         await _player.seek(Duration.zero);
-        await _player.play();
+        unawaited(_player.play());
       } catch (e) {
         debugPrint('Loop-one replay error: $e');
       }
@@ -146,10 +232,10 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
     }
   }
 
-  Future<void> _tryPlayIndex(int index) async {
+  Future<void> _tryPlayIndex(int index, {bool isRetry = false}) async {
     if (index < 0 || index >= queue.value.length) return;
 
-    final item = queue.value[index];
+    var item = queue.value[index];
     final trackId = item.extras?['trackId'] as String?;
 
     if (trackId != null && _brokenTrackIds.contains(trackId)) {
@@ -161,29 +247,94 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
       return;
     }
 
+    if (item.id.startsWith('pending:')) {
+      final resolved = await _resolvePending(index, item, trackId);
+      if (resolved == null) {
+        if (trackId != null) _brokenTrackIds.add(trackId);
+        _playbackErrorsController
+            .add('Не удалось воспроизвести: ${item.title}');
+        if (index + 1 < queue.value.length) {
+          await _tryPlayIndex(index + 1);
+        } else {
+          await _stopInternal();
+        }
+        return;
+      }
+      item = resolved;
+    }
+
+    _resetVolume(); // сбрасываем затухание перед новым треком
     _lastSwitchAt = DateTime.now();
+    mediaItem.add(item);
+
+    final nextIndex = index + 1;
+    final nextTrackId = nextIndex < queue.value.length
+        ? (queue.value[nextIndex].extras?['trackId'] as String?)
+        : null;
+    onTrackStarted?.call(item, nextTrackId);
 
     try {
       await _player.seek(Duration.zero, index: index);
-      await _player.play();
-      mediaItem.add(item);
-
-      final nextIndex = index + 1;
-      final nextTrackId = nextIndex < queue.value.length
-          ? (queue.value[nextIndex].extras?['trackId'] as String?)
-          : null;
-      onTrackStarted?.call(item, nextTrackId);
-
+      unawaited(_player.play());
       saveCurrentState();
     } catch (e) {
       debugPrint('Playback error at index $index ($trackId): $e');
+
+      if (!isRetry) {
+        try {
+          await Future.delayed(const Duration(milliseconds: 250));
+          await _player.seek(Duration.zero, index: index);
+          unawaited(_player.play());
+          saveCurrentState();
+          return;
+        } catch (e2) {
+          debugPrint('Retry failed for index $index ($trackId): $e2');
+        }
+      }
+
       if (trackId != null) _brokenTrackIds.add(trackId);
+      _playbackErrorsController.add('Не удалось воспроизвести: ${item.title}');
 
       if (index + 1 < queue.value.length) {
         await _tryPlayIndex(index + 1);
       } else {
         await _stopInternal();
       }
+    }
+  }
+
+  Future<MediaItem?> _resolvePending(
+      int index, MediaItem item, String? trackId) async {
+    if (trackId == null || resolveTrackUrl == null) return null;
+    try {
+      final url = await resolveTrackUrl!(trackId);
+      if (url == null || url.isEmpty) return null;
+
+      final updated = item.copyWith(id: url);
+
+      final q = queue.value.toList();
+      if (index < q.length) {
+        q[index] = updated;
+        queue.add(q);
+      }
+
+      final source = _player.audioSource;
+      if (source is ConcatenatingAudioSource) {
+        try {
+          final newSource = url.startsWith('http://') ||
+                  url.startsWith('https://')
+              ? AudioSource.uri(Uri.parse(url))
+              : AudioSource.file(url);
+          await source.removeAt(index);
+          await source.insert(index, newSource);
+        } catch (e) {
+          debugPrint('pending source replace error: $e');
+        }
+      }
+      return updated;
+    } catch (e) {
+      debugPrint('pending resolve error: $e');
+      return null;
     }
   }
 
@@ -235,7 +386,10 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
         );
 
         final id = item.id;
-        if (id.startsWith('http://') || id.startsWith('https://')) {
+        if (id.startsWith('pending:')) {
+          validSources.add(AudioSource.uri(Uri.parse('about:blank')));
+          validItems.add(item);
+        } else if (id.startsWith('http://') || id.startsWith('https://')) {
           validSources.add(AudioSource.uri(Uri.parse(id)));
           validItems.add(item);
         } else {
@@ -259,6 +413,8 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
 
     int targetIndex = savedIndex;
     if (targetIndex >= validItems.length) targetIndex = 0;
+    if (targetIndex < 0) targetIndex = 0;
+    final safePosition = savedPositionMs < 0 ? 0 : savedPositionMs;
 
     try {
       await _player
@@ -276,8 +432,8 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
 
       mediaItem.add(validItems[targetIndex]);
 
-      if (savedPositionMs > 0) {
-        await _player.seek(Duration(milliseconds: savedPositionMs));
+      if (safePosition > 0) {
+        await _player.seek(Duration(milliseconds: safePosition));
       }
     } catch (e) {
       debugPrint('Restore: setAudioSource error: $e');
@@ -304,8 +460,8 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
     if (_disposed) return;
     try {
       if (queue.value.isNotEmpty && _player.currentIndex != null) {
-        final List<String> queueJsonLines = queue.value.map((item) {
-          return json.encode({
+        final queueJsonList = queue.value.map((item) {
+          return {
             'id': item.id,
             'album': item.album ?? '',
             'title': item.title,
@@ -313,11 +469,11 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
             'artUri': item.artUri?.toString(),
             'duration': item.duration?.inMilliseconds,
             'extras': item.extras,
-          });
+          };
         }).toList();
 
         await _queueRepo.save(
-          queueJson: json.encode(queueJsonLines),
+          queueJson: json.encode(queueJsonList),
           currentIndex: _player.currentIndex!,
           positionMs: _player.position.inMilliseconds,
         );
@@ -343,6 +499,9 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
       speed: _player.speed,
       queueIndex: event.currentIndex,
       repeatMode: _getRepeatMode(_player.loopMode),
+      shuffleMode: _player.shuffleModeEnabled
+          ? AudioServiceShuffleMode.all
+          : AudioServiceShuffleMode.none,
     );
   }
 
@@ -382,6 +541,23 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
   }
 
   LoopMode getLoopMode() => _player.loopMode;
+
+  Future<void> setShuffleEnabled(bool enabled) async {
+    try {
+      await _player.setShuffleModeEnabled(enabled);
+      playbackState.add(
+        _transformEvent(
+          PlaybackEvent(currentIndex: _player.currentIndex ?? 0),
+        ),
+      );
+    } catch (e) {
+      debugPrint('setShuffleEnabled error: $e');
+    }
+  }
+
+  Future<void> toggleShuffle() async {
+    await setShuffleEnabled(!_player.shuffleModeEnabled);
+  }
 
   // ---------- ОЧЕРЕДЬ ----------
 
@@ -461,7 +637,9 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
     final newSource = item.id.startsWith('http://') ||
             item.id.startsWith('https://')
         ? AudioSource.uri(Uri.parse(item.id))
-        : AudioSource.file(item.id);
+        : (item.id.startsWith('pending:')
+            ? AudioSource.uri(Uri.parse('about:blank'))
+            : AudioSource.file(item.id));
 
     try {
       await source.insert(insertAt, newSource);
@@ -485,7 +663,9 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
     final newSource = item.id.startsWith('http://') ||
             item.id.startsWith('https://')
         ? AudioSource.uri(Uri.parse(item.id))
-        : AudioSource.file(item.id);
+        : (item.id.startsWith('pending:')
+            ? AudioSource.uri(Uri.parse('about:blank'))
+            : AudioSource.file(item.id));
 
     try {
       await source.add(newSource);
@@ -498,6 +678,7 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
   }
 
   Future<void> clearQueue() async {
+    _resetVolume();
     await _stopInternal();
     try {
       await _player.setAudioSource(ConcatenatingAudioSource(children: []));
@@ -520,6 +701,7 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
     if (_disposed) return;
 
     _brokenTrackIds.clear();
+    _resetVolume();
     debugPrint('setTracksAndPlay: ${items.length} items, start=$startIndex');
 
     if (_player.playing) {
@@ -532,7 +714,9 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
 
     final sources = items.map((item) {
       final id = item.id;
-      if (id.startsWith('http://') || id.startsWith('https://')) {
+      if (id.startsWith('pending:')) {
+        return AudioSource.uri(Uri.parse('about:blank'));
+      } else if (id.startsWith('http://') || id.startsWith('https://')) {
         return AudioSource.uri(Uri.parse(id));
       } else {
         return AudioSource.file(id);
@@ -554,30 +738,43 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
       }
 
       if (startIndex < items.length) {
-        mediaItem.add(items[startIndex]);
-      }
+        if (items[startIndex].id.startsWith('pending:')) {
+          _lastSwitchAt = DateTime.now();
+          await _tryPlayIndex(startIndex);
+        } else {
+          mediaItem.add(items[startIndex]);
+          _lastSwitchAt = DateTime.now();
+          unawaited(_player.play());
 
-      _lastSwitchAt = DateTime.now();
-      await _player.play();
-
-      if (startIndex < items.length) {
-        final nextIndex = startIndex + 1;
-        final nextTrackId = nextIndex < items.length
-            ? (items[nextIndex].extras?['trackId'] as String?)
-            : null;
-        onTrackStarted?.call(items[startIndex], nextTrackId);
+          final nextIndex = startIndex + 1;
+          final nextTrackId = nextIndex < items.length
+              ? (items[nextIndex].extras?['trackId'] as String?)
+              : null;
+          onTrackStarted?.call(items[startIndex], nextTrackId);
+        }
       }
 
       saveCurrentState();
     } catch (e) {
       debugPrint('setTracksAndPlay error: $e');
+      _resetVolume();
+      try {
+        await _player.stop();
+      } catch (_) {}
+      try {
+        await _player.setAudioSource(ConcatenatingAudioSource(children: []));
+      } catch (_) {}
+      queue.add([]);
+      mediaItem.add(null);
+      _brokenTrackIds.clear();
+      _playbackErrorsController.add('Не удалось загрузить очередь');
     }
   }
 
   @override
   Future<void> play() async {
     try {
-      await _player.play();
+      unawaited(_player.play());
       saveCurrentState();
     } catch (e) {
       debugPrint('play error: $e');
@@ -587,6 +784,7 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
   @override
   Future<void> pause() async {
     try {
+      _resetVolume();
       await _player.pause();
       saveCurrentState();
     } catch (e) {
@@ -597,9 +795,10 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
   Future<void> playOrPause() async {
     try {
       if (_player.playing) {
+        _resetVolume();
         await _player.pause();
       } else {
-        await _player.play();
+        unawaited(_player.play());
       }
       saveCurrentState();
     } catch (e) {
@@ -610,6 +809,7 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
   @override
   Future<void> seek(Duration position) async {
     try {
+      _resetVolume();
       await _player.seek(position);
       saveCurrentState();
     } catch (e) {
@@ -635,6 +835,7 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
 
   Future<void> _stopInternal() async {
     try {
+      _resetVolume();
       await _player.stop();
       await saveStateNow();
       try {
@@ -661,8 +862,11 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
   void dispose() {
     _disposed = true;
     _saveDebounceTimer?.cancel();
+    _fadeTimer?.cancel();
     _playerStateSub?.cancel();
     _durationSub?.cancel();
+    _positionFadeSub?.cancel();
+    _playbackErrorsController.close();
     if (!_readyCompleter.isCompleted) _readyCompleter.complete();
     _player.dispose();
   }

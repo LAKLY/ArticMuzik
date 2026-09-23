@@ -18,6 +18,9 @@ import 'theme/theme_notifier.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+    // Меньше evict'ов при скролле туда-сюда. Ничего визуально не меняет.
+  PaintingBinding.instance.imageCache.maximumSize = 2000;
+  PaintingBinding.instance.imageCache.maximumSizeBytes = 200 * 1024 * 1024;
 
   ErrorWidget.builder = (FlutterErrorDetails details) {
     debugPrint('ErrorWidget: ${details.exception}');
@@ -91,6 +94,9 @@ void main() async {
 
   // Создаём провайдер заранее — нужно связать его с audioHandler
   final yandexProvider = YandexAudioProvider(yandexAuth);
+
+  audioHandler.resolveTrackUrl =
+      (trackId) => yandexProvider.getDirectUrl(trackId);
 
   // Связка: когда трек стартует — preload следующего + запись в историю
   audioHandler.onTrackStarted = (currentItem, nextTrackId) {

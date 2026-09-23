@@ -1,50 +1,33 @@
 part of 'main_screen.dart';
 
-/// Экран поиска с оптимизированной производительностью и управлением фокусом
 class _SearchContent extends StatefulWidget {
   final VoidCallback onPlay;
   final Function(Map<String, String>) onLongPressTrack;
   final VoidCallback onRequestSwitchStart;
   final VoidCallback onRequestSwitchEnd;
-  final String? currentTrackId;
+  final ValueListenable<MediaItem?>? mediaItemListenable;
 
   const _SearchContent({
     required this.onPlay,
     required this.onLongPressTrack,
     required this.onRequestSwitchStart,
     required this.onRequestSwitchEnd,
-    this.currentTrackId,
+    this.mediaItemListenable,
   });
 
   @override
   State<_SearchContent> createState() => _SearchContentState();
 }
 
-class _SearchContentState extends State<_SearchContent> with AutomaticKeepAliveClientMixin {
+class _SearchContentState extends State<_SearchContent>
+    with AutomaticKeepAliveClientMixin {
   final TextEditingController _controller = TextEditingController();
   final FocusNode _focusNode = FocusNode();
   int? _loadingSearchIndex;
-  String? _currentTrackId;
   Timer? _debounceTimer;
 
   @override
   bool get wantKeepAlive => true;
-
-  @override
-  void initState() {
-    super.initState();
-    _currentTrackId = widget.currentTrackId;
-  }
-
-  @override
-  void didUpdateWidget(covariant _SearchContent oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (widget.currentTrackId != oldWidget.currentTrackId) {
-      setState(() {
-        _currentTrackId = widget.currentTrackId;
-      });
-    }
-  }
 
   @override
   void dispose() {
@@ -54,8 +37,8 @@ class _SearchContentState extends State<_SearchContent> with AutomaticKeepAliveC
     super.dispose();
   }
 
-  // ========== ВОСПРОИЗВЕДЕНИЕ ИЗ СПИСКА ==========
-  Future<void> _playTracksFromList(List<Map<String, String>> tracks, int selectedIndex) async {
+  Future<void> _playTracksFromList(
+      List<Map<String, String>> tracks, int selectedIndex) async {
     FocusScope.of(context).unfocus();
 
     final audioHandler = Provider.of<AppAudioHandler>(context, listen: false);
@@ -64,59 +47,60 @@ class _SearchContentState extends State<_SearchContent> with AutomaticKeepAliveC
     widget.onRequestSwitchStart();
     setState(() => _loadingSearchIndex = selectedIndex);
 
-    final futures = tracks.map((track) async {
-      final trackId = track['trackId']!;
-      final url = await provider.getDirectUrl(trackId);
-      if (url == null) return null;
-      return MediaItem(
-        id: url,
-        album: "",
-        title: track["title"]!,
-        artist: track["artist"]!,
-        artUri: Uri.parse(track["cover"]!),
-        extras: {"trackId": trackId},
-      );
-    }).toList();
-
-    final items = await Future.wait(futures);
-    final validItems = items.whereType<MediaItem>().toList();
-
-    setState(() => _loadingSearchIndex = null);
-
-    if (validItems.isEmpty) {
-      widget.onRequestSwitchEnd();
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Не удалось загрузить треки")),
-      );
-      return;
-    }
-
-    final selectedTrackId = tracks[selectedIndex]['trackId']!;
-    final startIdx = validItems.indexWhere((item) => item.extras?['trackId'] == selectedTrackId);
-    if (startIdx == -1) {
-      widget.onRequestSwitchEnd();
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Не удалось загрузить выбранный трек")),
-      );
-      return;
-    }
-
     try {
-      await audioHandler.ready;
-      await audioHandler.setTracksAndPlay(validItems, startIdx);
-      widget.onPlay();
-      widget.onRequestSwitchEnd();
-    } catch (e) {
-      widget.onRequestSwitchEnd();
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Ошибка воспроизведения: $e")),
+      final preload = <int>{
+        selectedIndex,
+        if (selectedIndex + 1 < tracks.length) selectedIndex + 1,
+        if (selectedIndex + 2 < tracks.length) selectedIndex + 2,
+      };
+
+      final urlMap = <int, String>{};
+      await Future.wait(preload.map((i) async {
+        final t = tracks[i];
+        final url = await provider.getDirectUrl(t['trackId']!);
+        if (url != null && url.isNotEmpty) urlMap[i] = url;
+      }));
+
+      final startUrl = urlMap[selectedIndex];
+      if (startUrl == null || startUrl.isEmpty) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Не удалось загрузить трек")),
+          );
+        }
+        return;
+      }
+
+      final items = <MediaItem>[];
+      for (int i = 0; i < tracks.length; i++) {
+        final t = tracks[i];
+        final trackId = t['trackId']!;
+        final url = urlMap[i];
+        items.add(
+          MediaItem(
+            id: url ?? 'pending:$trackId',
+            album: "",
+            title: t['title'] ?? '',
+            artist: t['artist'] ?? '',
+            artUri: (t['cover'] ?? '').isNotEmpty
+                ? Uri.parse(t['cover']!)
+                : null,
+            extras: {'trackId': trackId},
+          ),
         );
       }
+
+      await audioHandler.ready;
+      await audioHandler.setTracksAndPlay(items, selectedIndex);
+      widget.onPlay();
+    } finally {
+      if (mounted) setState(() => _loadingSearchIndex = null);
+      widget.onRequestSwitchEnd();
     }
   }
 
-  Future<void> _onItemTap(BuildContext context, int index, Map<String, String> item) async {
+  Future<void> _onItemTap(
+      BuildContext context, int index, Map<String, String> item) async {
     final provider = Provider.of<YandexAudioProvider>(context, listen: false);
     final type = item['type'];
     if (type == 'artist') {
@@ -133,7 +117,8 @@ class _SearchContentState extends State<_SearchContent> with AutomaticKeepAliveC
       final tracks = await provider.getAlbumTracks(albumTitle, artistName);
       _showTracksDialog('Треки альбома: $albumTitle', tracks);
     } else {
-      final allTrackResults = provider.searchResults.where((r) => r['type'] == 'track').toList();
+      final allTrackResults =
+          provider.searchResults.where((r) => r['type'] == 'track').toList();
       if (allTrackResults.isNotEmpty) {
         await _playTracksFromList(allTrackResults, index);
       } else {
@@ -145,11 +130,11 @@ class _SearchContentState extends State<_SearchContent> with AutomaticKeepAliveC
   void _showTracksDialog(String title, List<Map<String, String>> tracks) {
     FocusScope.of(context).unfocus();
 
-    final audioHandler = Provider.of<AppAudioHandler>(context, listen: false);
     showModalBottomSheet(
       context: context,
       backgroundColor: ArticTheme.backgroundDarkest,
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
       builder: (context) => DraggableScrollableSheet(
         initialChildSize: 0.6,
         minChildSize: 0.4,
@@ -159,7 +144,11 @@ class _SearchContentState extends State<_SearchContent> with AutomaticKeepAliveC
           children: [
             Padding(
               padding: const EdgeInsets.all(16),
-              child: Text(title, style: TextStyle(color: ArticTheme.primary, fontSize: 20, fontWeight: FontWeight.bold)),
+              child: Text(title,
+                  style: TextStyle(
+                      color: ArticTheme.primary,
+                      fontSize: 20,
+                      fontWeight: FontWeight.bold)),
             ),
             Expanded(
               child: ListView.builder(
@@ -175,12 +164,17 @@ class _SearchContentState extends State<_SearchContent> with AutomaticKeepAliveC
                         width: 40,
                         height: 40,
                         fit: BoxFit.cover,
-                        placeholder: (_, __) => Container(color: Colors.white10),
-                        errorWidget: (_, __, ___) => Container(color: Colors.white10, child: const Icon(Icons.music_note)),
+                        placeholder: (_, __) =>
+                            Container(color: Colors.white10),
+                        errorWidget: (_, __, ___) => Container(
+                            color: Colors.white10,
+                            child: const Icon(Icons.music_note)),
                       ),
                     ),
-                    title: Text(track["title"]!, style: TextStyle(color: ArticTheme.primary)),
-                    subtitle: Text(track["artist"]!, style: TextStyle(color: ArticTheme.secondary)),
+                    title: Text(track["title"]!,
+                        style: TextStyle(color: ArticTheme.primary)),
+                    subtitle: Text(track["artist"]!,
+                        style: TextStyle(color: ArticTheme.secondary)),
                     onTap: () async {
                       Navigator.pop(context);
                       await _playTracksFromList(tracks, i);
@@ -225,15 +219,19 @@ class _SearchContentState extends State<_SearchContent> with AutomaticKeepAliveC
                 onSearch: _performSearch,
                 onClear: () {
                   _controller.clear();
-                  Provider.of<YandexAudioProvider>(context, listen: false).clearSearch();
+                  Provider.of<YandexAudioProvider>(context, listen: false)
+                      .clearSearch();
                   _focusNode.unfocus();
                 },
               ),
               const SizedBox(height: 12),
               _SearchFilters(
-                searchType: Provider.of<YandexAudioProvider>(context, listen: false).searchType,
+                searchType: Provider.of<YandexAudioProvider>(context,
+                        listen: false)
+                    .searchType,
                 onTypeChanged: (type) {
-                  Provider.of<YandexAudioProvider>(context, listen: false).searchType = type;
+                  Provider.of<YandexAudioProvider>(context, listen: false)
+                      .searchType = type;
                   _focusNode.unfocus();
                 },
               ),
@@ -243,7 +241,7 @@ class _SearchContentState extends State<_SearchContent> with AutomaticKeepAliveC
         Expanded(
           child: _SearchResultsList(
             loadingIndex: _loadingSearchIndex,
-            currentTrackId: _currentTrackId,
+            mediaItemListenable: widget.mediaItemListenable,
             onItemTap: _onItemTap,
             onLongPress: widget.onLongPressTrack,
           ),
@@ -255,7 +253,6 @@ class _SearchContentState extends State<_SearchContent> with AutomaticKeepAliveC
 
 // ============= ВСПОМОГАТЕЛЬНЫЕ ВИДЖЕТЫ =============
 
-/// Текстовое поле поиска (изолированное)
 class _SearchTextField extends StatefulWidget {
   final TextEditingController controller;
   final FocusNode focusNode;
@@ -305,7 +302,9 @@ class __SearchTextFieldState extends State<_SearchTextField> {
         ),
         filled: true,
         fillColor: ArticTheme.backgroundDarkest.withValues(alpha: 0.6),
-        border: OutlineInputBorder(borderRadius: BorderRadius.circular(30), borderSide: BorderSide.none),
+        border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(30),
+            borderSide: BorderSide.none),
         focusedBorder: OutlineInputBorder(
           borderRadius: BorderRadius.circular(30),
           borderSide: BorderSide(color: ArticTheme.accent, width: 1.5),
@@ -319,7 +318,6 @@ class __SearchTextFieldState extends State<_SearchTextField> {
   }
 }
 
-/// Фильтры поиска
 class _SearchFilters extends StatelessWidget {
   final String searchType;
   final ValueChanged<String> onTypeChanged;
@@ -370,7 +368,9 @@ class _SearchFilterChip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return FilterChip(
-      label: Text(label, style: TextStyle(color: isSelected ? ArticTheme.primary : ArticTheme.secondary)),
+      label: Text(label,
+          style: TextStyle(
+              color: isSelected ? ArticTheme.primary : ArticTheme.secondary)),
       selected: isSelected,
       onSelected: (_) => onSelected(),
       backgroundColor: ArticTheme.backgroundDarkest.withValues(alpha: 0.6),
@@ -380,16 +380,15 @@ class _SearchFilterChip extends StatelessWidget {
   }
 }
 
-/// Список результатов поиска – вынесен в отдельный виджет с подпиской на провайдер
 class _SearchResultsList extends StatelessWidget {
   final int? loadingIndex;
-  final String? currentTrackId;
+  final ValueListenable<MediaItem?>? mediaItemListenable;
   final Future<void> Function(BuildContext, int, Map<String, String>) onItemTap;
   final Function(Map<String, String>) onLongPress;
 
   const _SearchResultsList({
     required this.loadingIndex,
-    required this.currentTrackId,
+    required this.mediaItemListenable,
     required this.onItemTap,
     required this.onLongPress,
   });
@@ -408,30 +407,46 @@ class _SearchResultsList extends StatelessWidget {
               children: [
                 Icon(Icons.search, size: 64, color: ArticTheme.secondary),
                 const SizedBox(height: 16),
-                Text("Введите запрос для поиска", style: TextStyle(color: ArticTheme.secondary)),
+                Text("Введите запрос для поиска",
+                    style: TextStyle(color: ArticTheme.secondary)),
               ],
             ),
           );
         }
 
         if (isSearching && searchResults.isEmpty) {
-          return Center(child: CircularProgressIndicator(color: ArticTheme.accent));
+          return Center(
+              child: CircularProgressIndicator(color: ArticTheme.accent));
         }
 
-        return ListView.builder(
-          padding: EdgeInsets.symmetric(horizontal: MediaQuery.of(context).size.width * 0.04),
-          itemCount: searchResults.length,
-          itemBuilder: (context, index) {
-            final item = searchResults[index];
-            final isCurrentTrack = currentTrackId != null && item['trackId'] == currentTrackId;
-            return _SearchResultTile(
-              key: ValueKey(item['trackId']), // Уникальный ключ
-              item: item,
-              onTap: () => onItemTap(context, index, item),
-              onLongPress: () => onLongPress(item),
-              isLoading: loadingIndex == index,
-              isCurrentTrack: isCurrentTrack,
-            );
+        Widget buildList(String? currentTrackId) {
+          return ListView.builder(
+            padding: EdgeInsets.symmetric(
+                horizontal: MediaQuery.of(context).size.width * 0.04),
+            itemCount: searchResults.length,
+            itemBuilder: (context, index) {
+              final item = searchResults[index];
+              final isCurrentTrack =
+                  currentTrackId != null && item['trackId'] == currentTrackId;
+              return _SearchResultTile(
+                key: ValueKey(item['trackId']),
+                item: item,
+                onTap: () => onItemTap(context, index, item),
+                onLongPress: () => onLongPress(item),
+                isLoading: loadingIndex == index,
+                isCurrentTrack: isCurrentTrack,
+              );
+            },
+          );
+        }
+
+        if (mediaItemListenable == null) {
+          return buildList(null);
+        }
+        return ValueListenableBuilder<MediaItem?>(
+          valueListenable: mediaItemListenable!,
+          builder: (context, item, _) {
+            return buildList(item?.extras?['trackId'] as String?);
           },
         );
       },
@@ -447,7 +462,7 @@ class _SearchResultTile extends StatelessWidget {
   final bool isCurrentTrack;
 
   const _SearchResultTile({
-    super.key, // Ключ принимается
+    super.key,
     required this.item,
     required this.onTap,
     required this.onLongPress,
@@ -471,7 +486,9 @@ class _SearchResultTile extends StatelessWidget {
               ? ArticTheme.accent.withValues(alpha: 0.1)
               : ArticTheme.backgroundDarkest.withValues(alpha: 0.6),
           borderRadius: BorderRadius.circular(20),
-          border: isCurrentTrack ? Border.all(color: ArticTheme.accent, width: 1.2) : null,
+          border: isCurrentTrack
+              ? Border.all(color: ArticTheme.accent, width: 1.2)
+              : null,
         ),
         child: Row(
           children: [
@@ -498,18 +515,29 @@ class _SearchResultTile extends StatelessWidget {
                       Expanded(
                         child: Text(item["title"]!,
                             style: TextStyle(
-                              color: isCurrentTrack ? ArticTheme.accent : ArticTheme.primary,
+                              color: isCurrentTrack
+                                  ? ArticTheme.accent
+                                  : ArticTheme.primary,
                               fontWeight: FontWeight.w500,
                               fontSize: 16,
                             ),
                             overflow: TextOverflow.ellipsis),
                       ),
-                      if (item["isFavorite"] == "true") Icon(Icons.favorite, size: 16, color: ArticTheme.accent),
+                      if (item["isFavorite"] == "true")
+                        Icon(Icons.favorite,
+                            size: 16, color: ArticTheme.accent),
                       const SizedBox(width: 4),
-                      if (item["cached"] == "true") Icon(Icons.download_done, size: 16, color: ArticTheme.secondary),
+                      if (item["cached"] == "true")
+                        Icon(Icons.download_done,
+                            size: 16, color: ArticTheme.secondary),
                     ],
                   ),
-                  Text(item["artist"] ?? '', style: TextStyle(color: isCurrentTrack ? ArticTheme.accent : ArticTheme.secondary, fontSize: 13)),
+                  Text(item["artist"] ?? '',
+                      style: TextStyle(
+                          color: isCurrentTrack
+                              ? ArticTheme.accent
+                              : ArticTheme.secondary,
+                          fontSize: 13)),
                 ],
               ),
             ),
@@ -522,7 +550,8 @@ class _SearchResultTile extends StatelessWidget {
             else if (isCurrentTrack)
               Icon(Icons.equalizer, color: ArticTheme.primary, size: 28)
             else
-              Icon(Icons.play_circle_outline, color: ArticTheme.accent.withValues(alpha: 0.7), size: 28),
+              Icon(Icons.play_circle_outline,
+                  color: ArticTheme.accent.withValues(alpha: 0.7), size: 28),
           ],
         ),
       ),

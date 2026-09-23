@@ -11,6 +11,7 @@ class __SettingsContentState extends State<_SettingsContent>
     with AutomaticKeepAliveClientMixin {
   bool _hapticEnabled = true;
   AppTheme _currentTheme = AppTheme.defaultTheme;
+  int _crossfadeSeconds = 0;
 
   @override
   bool get wantKeepAlive => true;
@@ -24,8 +25,10 @@ class __SettingsContentState extends State<_SettingsContent>
   Future<void> _loadSettings() async {
     final prefs = await SharedPreferences.getInstance();
     final themeName = prefs.getString('app_theme') ?? 'defaultTheme';
+    final crossfade = prefs.getInt('crossfade_seconds') ?? 0;
     setState(() {
       _currentTheme = _parseTheme(themeName);
+      _crossfadeSeconds = crossfade.clamp(0, 5);
     });
   }
 
@@ -52,6 +55,12 @@ class __SettingsContentState extends State<_SettingsContent>
     );
   }
 
+  Future<void> _changeCrossfade(int seconds) async {
+    final handler = Provider.of<AppAudioHandler>(context, listen: false);
+    await handler.setCrossfadeSeconds(seconds);
+    setState(() => _crossfadeSeconds = seconds);
+  }
+
   Future<void> _logout() async {
     final auth = Provider.of<YandexAuthService>(context, listen: false);
     await auth.logout();
@@ -59,24 +68,18 @@ class __SettingsContentState extends State<_SettingsContent>
   }
 
   void _openStorage() {
-    Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => const StorageManagerScreen()),
-    );
+    Navigator.push(context,
+        MaterialPageRoute(builder: (_) => const StorageManagerScreen()));
   }
 
   void _openDownloads() {
-    Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => const DownloadsScreen()),
-    );
+    Navigator.push(context,
+        MaterialPageRoute(builder: (_) => const DownloadsScreen()));
   }
 
   void _openHistory() {
-    Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => const HistoryScreen()),
-    );
+    Navigator.push(context,
+        MaterialPageRoute(builder: (_) => const HistoryScreen()));
   }
 
   @override
@@ -95,6 +98,14 @@ class __SettingsContentState extends State<_SettingsContent>
                   fontWeight: FontWeight.w600,
                   color: ArticTheme.primary)),
           const SizedBox(height: 24),
+
+          // ---------- Плеер ----------
+          _sectionLabel("Плеер"),
+          _buildCrossfadeTile(),
+          const SizedBox(height: 8),
+
+          // ---------- Интерфейс ----------
+          _sectionLabel("Интерфейс"),
           _buildTile(
             title: "Тактильная отдача",
             subtitle: "Вибрация при смене вкладок",
@@ -106,6 +117,9 @@ class __SettingsContentState extends State<_SettingsContent>
             ),
           ),
           _buildThemeSelector(),
+
+          // ---------- Хранилище ----------
+          _sectionLabel("Хранилище"),
           _buildTile(
             title: "Хранилище",
             subtitle: "Управление кэшем и закреплёнными треками",
@@ -127,6 +141,9 @@ class __SettingsContentState extends State<_SettingsContent>
             iconColor: ArticTheme.accent,
             onTap: _openHistory,
           ),
+
+          // ---------- Аккаунт ----------
+          _sectionLabel("Аккаунт"),
           _buildTile(
             title: "Выйти из Яндекс.Музыки",
             subtitle: "Сбросить токен и выйти из аккаунта",
@@ -143,8 +160,8 @@ class __SettingsContentState extends State<_SettingsContent>
               context: context,
               builder: (_) => AlertDialog(
                 backgroundColor: ArticTheme.backgroundDarkest,
-                title:
-                    Text("ArticMuzik", style: TextStyle(color: ArticTheme.primary)),
+                title: Text("ArticMuzik",
+                    style: TextStyle(color: ArticTheme.primary)),
                 content: Text(
                   "Минималистичный музыкальный плеер с поддержкой Яндекс.Музыки.",
                   style: TextStyle(color: ArticTheme.secondary),
@@ -163,6 +180,92 @@ class __SettingsContentState extends State<_SettingsContent>
         ],
       ),
     );
+  }
+
+  Widget _sectionLabel(String label) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 4, bottom: 10),
+      child: Text(
+        label.toUpperCase(),
+        style: TextStyle(
+          color: ArticTheme.secondary.withValues(alpha: 0.7),
+          fontSize: 11,
+          letterSpacing: 1.2,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCrossfadeTile() {
+    final value = _crossfadeSeconds;
+    final subtitle = value == 0 ? 'Выключен' : '$value ${_pluralSeconds(value)}';
+    return Container(
+      margin: const EdgeInsets.only(bottom: 16),
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
+      decoration: BoxDecoration(
+        color: ArticTheme.backgroundDarkest.withValues(alpha: 0.6),
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.gradient, color: ArticTheme.accent),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text("Кроссфейд",
+                        style: TextStyle(
+                            color: ArticTheme.primary,
+                            fontWeight: FontWeight.w500)),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Плавное затухание в конце трека • $subtitle',
+                      style: TextStyle(
+                          color: ArticTheme.secondary, fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          SliderTheme(
+            data: SliderThemeData(
+              trackHeight: 2,
+              activeTrackColor: ArticTheme.accent,
+              inactiveTrackColor:
+                  ArticTheme.secondary.withValues(alpha: 0.3),
+              thumbColor: ArticTheme.primary,
+              overlayColor: ArticTheme.accent.withValues(alpha: 0.15),
+              thumbShape:
+                  const RoundSliderThumbShape(enabledThumbRadius: 6),
+              overlayShape:
+                  const RoundSliderOverlayShape(overlayRadius: 14),
+            ),
+            child: Slider(
+              value: value.toDouble(),
+              min: 0,
+              max: 5,
+              divisions: 5,
+              label: value == 0 ? 'Выкл' : '$value с',
+              onChanged: (v) => _changeCrossfade(v.round()),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _pluralSeconds(int n) {
+    if (n % 10 == 1 && n % 100 != 11) return 'секунда';
+    if (n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 10 || n % 100 >= 20)) {
+      return 'секунды';
+    }
+    return 'секунд';
   }
 
   Widget _buildThemeSelector() {

@@ -1,24 +1,22 @@
 import 'dart:async';
-import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_animate/flutter_animate.dart';
 import 'package:audio_service/audio_service.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:provider/provider.dart';
-import 'package:just_audio/just_audio.dart';
+import 'package:flutter/foundation.dart';
 import '../theme/artic_theme.dart';
 import '../utils/color_utils.dart';
 import '../screens/full_player_page.dart';
 import '../services/audio_handler.dart';
 import '../services/yandex/yandex_audio_provider.dart';
 import '../services/yandex/yandex_auth_service.dart';
-import '../utils/matrix_background.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../theme/theme_notifier.dart';
 import 'storage_manager_screen.dart';
 import 'downloads_screen.dart';
 import 'history_screen.dart';
+import 'queue_sheet.dart';
 
 part 'main_screen_library.dart';
 part 'main_screen_miniplayer.dart';
@@ -42,22 +40,19 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
   late PageController _pageController;
   int? _loadingTrackIndex;
 
-  bool _showMiniPlayer = false;
-  Color _dominantColor = ArticTheme.accent;
-  CancelToken? _colorCancelToken;
-  MediaItem? _currentMediaItem;
-  String? _lastDominantColorCover;
-  DateTime _lastLibraryUpdate =
-      DateTime.now().subtract(const Duration(minutes: 1));
-  DateTime _lastCacheUpdate =
-      DateTime.now().subtract(const Duration(minutes: 1));
-
-  // Кэшируем последнее состояние, чтобы не дёргать setState впустую
-  bool? _lastPlaying;
-  AudioProcessingState? _lastProcessingState;
+  /// Notifier'ы вместо полей + setState. Обновляются из подписок,
+  /// не пересобирают MainScreen. Слушают их только конкретные виджеты
+  /// (фон и SearchContent).
+  final ValueNotifier<MediaItem?> _mediaItemNotifier =
+      ValueNotifier<MediaItem?>(null);
+  final ValueNotifier<Color> _dominantColorNotifier =
+      ValueNotifier<Color>(ArticTheme.accent);
 
   StreamSubscription<MediaItem?>? _mediaItemSubscription;
-  StreamSubscription<PlaybackState>? _playbackStateSubscription;
+  StreamSubscription<String>? _playbackErrorsSubscription;
+  String? _lastDominantColorCover;
+  CancelToken? _colorCancelToken;
+  bool _depsInitialized = false;
 
   @override
   void initState() {
@@ -68,60 +63,35 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    audioHandler = Provider.of<AppAudioHandler>(context);
-    yandexProvider = Provider.of<YandexAudioProvider>(context);
+    if (_depsInitialized) return;
+    _depsInitialized = true;
 
-    _mediaItemSubscription = audioHandler.mediaItem.listen(_onMediaItemChanged);
-    _playbackStateSubscription =
-        audioHandler.playbackState.listen(_onPlaybackStateChanged);
+    audioHandler = Provider.of<AppAudioHandler>(context, listen: false);
+    yandexProvider = Provider.of<YandexAudioProvider>(context, listen: false);
 
-    final mediaItem = audioHandler.mediaItem.value;
-    final ps = audioHandler.playbackState.value;
-    _lastPlaying = ps.playing;
-    _lastProcessingState = ps.processingState;
-
-    if (mediaItem != null) {
-      _currentMediaItem = mediaItem;
-      _showMiniPlayer = true;
+    // Единственная подписка MainScreen — обновляем ValueNotifier'ы.
+    // setState не вызывается, MainScreen.build не пересобирается.
+    _mediaItemSubscription = audioHandler.mediaItem.listen((item) {
+      _mediaItemNotifier.value = item;
       _refreshDominantColor();
-    }
-  }
-
-  void _onMediaItemChanged(MediaItem? mediaItem) {
-    if (mediaItem == null) {
-      if (_currentMediaItem != null) {
-        setState(() {
-          _currentMediaItem = null;
-          _showMiniPlayer = false;
-        });
-      }
-      return;
-    }
-
-    final changed = _currentMediaItem?.id != mediaItem.id;
-    setState(() {
-      _currentMediaItem = mediaItem;
-      _showMiniPlayer = true;
     });
+    _playbackErrorsSubscription =
+        audioHandler.playbackErrors.listen(_onPlaybackError);
 
-    if (changed) _refreshDominantColor();
+    // Стартовое значение
+    _mediaItemNotifier.value = audioHandler.mediaItem.value;
+    _refreshDominantColor();
   }
 
-  void _onPlaybackStateChanged(PlaybackState state) {
+  void _onPlaybackError(String message) {
     if (!mounted) return;
-
-    final playingChanged = _lastPlaying != state.playing;
-    final processingChanged = _lastProcessingState != state.processingState;
-
-    if (!playingChanged && !processingChanged) return;
-
-    _lastPlaying = state.playing;
-    _lastProcessingState = state.processingState;
-
-    setState(() {});
-    if (state.playing && _currentMediaItem != null && !_showMiniPlayer) {
-      setState(() => _showMiniPlayer = true);
-    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        duration: const Duration(seconds: 3),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
   }
 
   Future<void> _refreshDominantColor() async {
@@ -140,81 +110,88 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
       cancelToken: _colorCancelToken,
     );
     if (mounted && _colorCancelToken?.isCancelled == false) {
-      setState(() => _dominantColor = color);
+      _dominantColorNotifier.value = color;
     }
   }
-
-  void _playPause() => audioHandler.playOrPause();
-  void _nextTrack() => audioHandler.skipToNext();
-  void _previousTrack() => audioHandler.skipToPrevious();
 
   void _changeTab(int newTab) {
     if (_currentTab == newTab) return;
     FocusScope.of(context).unfocus();
     HapticFeedback.lightImpact();
-    setState(() => _currentTab = newTab);
-    _pageController.animateToPage(newTab,
-        duration: const Duration(milliseconds: 250), curve: Curves.easeOutCubic);
-    if (newTab == 0 &&
-        DateTime.now().difference(_lastLibraryUpdate).inSeconds > 30) {
-      _refreshFavorites();
-    }
+    _pageController.animateToPage(
+      newTab,
+      duration: const Duration(milliseconds: 250),
+      curve: Curves.easeOutCubic,
+    );
   }
 
   Future<void> _refreshFavorites() async {
     await yandexProvider.loadFavorites();
-    _lastLibraryUpdate = DateTime.now();
   }
 
   Future<void> _refreshCached() async {
     await yandexProvider.reloadCachedTracks();
-    _lastCacheUpdate = DateTime.now();
   }
 
-  // ========== ФОРМИРОВАНИЕ ОЧЕРЕДИ ИЗ ДИАЛОГА ==========
+  // ========== ФОРМИРОВАНИЕ ОЧЕРЕДИ ==========
+
+  /// Лениво: URL тянем только для стартового + 2 соседей.
+  /// Остальные — плейсхолдеры. AudioHandler подтянет их при skipToNext.
   Future<void> _playTracksFromDialog(
       List<Map<String, String>> tracks, int selectedIndex) async {
     if (!mounted) return;
+    await _playLazyQueue(tracks, selectedIndex);
+  }
 
-    final futures = tracks.map((track) async {
-      final trackId = track['trackId']!;
-      final url = await yandexProvider.getDirectUrl(trackId);
-      if (url == null) return null;
-      return MediaItem(
-        id: url,
-        album: "",
-        title: track['title']!,
-        artist: track['artist']!,
-        artUri: Uri.parse(track['cover']!),
-        extras: {'trackId': trackId},
-      );
-    }).toList();
+  Future<void> _playLazyQueue(
+      List<Map<String, String>> tracks, int selectedIndex) async {
+    if (tracks.isEmpty) return;
 
-    final items = (await Future.wait(futures)).whereType<MediaItem>().toList();
+    final preload = <int>{
+      selectedIndex,
+      if (selectedIndex + 1 < tracks.length) selectedIndex + 1,
+      if (selectedIndex + 2 < tracks.length) selectedIndex + 2,
+    };
 
-    if (!mounted) return;
+    // Сначала подтянем URL для окна preload — параллельно.
+    final urlMap = <int, String>{};
+    await Future.wait(preload.map((i) async {
+      final t = tracks[i];
+      final url = await yandexProvider.getDirectUrl(t['trackId']!);
+      if (url != null && url.isNotEmpty) urlMap[i] = url;
+    }));
 
-    if (items.isEmpty) {
+    // Стартовый обязательно должен быть
+    final startUrl = urlMap[selectedIndex];
+    if (startUrl == null || startUrl.isEmpty) {
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Не удалось загрузить треки")),
+        const SnackBar(content: Text("Не удалось загрузить трек")),
       );
       return;
     }
 
-    final selectedTrackId = tracks[selectedIndex]['trackId']!;
-    final startIdx =
-        items.indexWhere((item) => item.extras?['trackId'] == selectedTrackId);
-    if (startIdx == -1) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Не удалось загрузить выбранный трек")),
+    final items = <MediaItem>[];
+    for (int i = 0; i < tracks.length; i++) {
+      final t = tracks[i];
+      final trackId = t['trackId']!;
+      final url = urlMap[i];
+      items.add(
+        MediaItem(
+          id: url ?? 'pending:$trackId',
+          album: "",
+          title: t['title'] ?? '',
+          artist: t['artist'] ?? '',
+          artUri: (t['cover'] ?? '').isNotEmpty
+              ? Uri.parse(t['cover']!)
+              : null,
+          extras: {'trackId': trackId},
+        ),
       );
-      return;
     }
 
     await audioHandler.ready;
-    await audioHandler.setTracksAndPlay(items, startIdx);
-    if (!mounted) return;
-    setState(() => _showMiniPlayer = true);
+    await audioHandler.setTracksAndPlay(items, selectedIndex);
   }
 
   // ========== ДИАЛОГИ И ДЕЙСТВИЯ С ТРЕКАМИ ==========
@@ -448,81 +425,33 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
     if (!mounted) return;
     setState(() => _loadingTrackIndex = index);
 
-    final List<Future<Map<String, dynamic>?>> futures = [];
-    for (final track in tracksList) {
-      final trackId = track['trackId']!;
-      futures.add(
-        yandexProvider.getDirectUrl(trackId).then((url) {
-          if (url == null || url.isEmpty) return null;
-          return {
-            'url': url,
-            'title': track['title']!,
-            'artist': track['artist']!,
-            'cover': track['cover']!,
-            'trackId': trackId,
-          };
-        }).catchError((e) {
-          debugPrint('Ошибка получения ссылки для $trackId: $e');
-          return null;
-        }),
-      );
-    }
-
-    final results = await Future.wait(futures);
-
-    if (!mounted) return;
-
-    final itemsAll = <MediaItem>[];
-    for (final result in results) {
-      if (result != null) {
-        itemsAll.add(MediaItem(
-          id: result['url']!,
-          album: "",
-          title: result['title']!,
-          artist: result['artist']!,
-          artUri: Uri.parse(result['cover']!),
-          extras: {'trackId': result['trackId']!},
-        ));
-      }
-    }
-
-    if (itemsAll.isEmpty) {
-      setState(() => _loadingTrackIndex = null);
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Не удалось загрузить ни одного трека")),
-      );
-      return;
-    }
-
-    final selectedTrackId = tracksList[index]['trackId']!;
-    int startIdx = itemsAll.indexWhere(
-        (item) => item.extras?['trackId'] == selectedTrackId);
-    if (startIdx == -1) {
-      setState(() => _loadingTrackIndex = null);
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Не удалось загрузить выбранный трек")),
-      );
-      return;
-    }
-
-    setState(() {
-      _currentMediaItem = itemsAll[startIdx];
-      _showMiniPlayer = true;
-      _loadingTrackIndex = null;
-    });
-
-    _refreshDominantColor();
-
     try {
-      await audioHandler.ready;
-      await audioHandler.setTracksAndPlay(itemsAll, startIdx);
+      await _playLazyQueue(tracksList, index);
     } catch (e) {
+      debugPrint('selectTrack error: $e');
       if (!mounted) return;
-      setState(() => _loadingTrackIndex = null);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text("Ошибка воспроизведения: $e")),
       );
+    } finally {
+      if (mounted) setState(() => _loadingTrackIndex = null);
     }
+  }
+
+  // ========== PLAY ALL / SHUFFLE ALL ==========
+  /// Играть всю библиотеку с начала.
+  Future<void> _playLibraryAll() async {
+    final list = yandexProvider.tracks;
+    if (list.isEmpty) return;
+    await _playLazyQueue(list, 0);
+  }
+
+  /// Играть всю библиотеку вперемешку.
+  Future<void> _playLibraryShuffle() async {
+    final list = List<Map<String, String>>.from(yandexProvider.tracks);
+    if (list.isEmpty) return;
+    list.shuffle();
+    await _playLazyQueue(list, 0);
   }
 
   // ========== ВЫБОР ТРЕКА ИЗ КЭША ==========
@@ -556,6 +485,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
 
     final startIdx = items.indexWhere((item) => item.id == trackUrl);
     if (startIdx == -1) {
+      if (!mounted) return;
       setState(() => _loadingTrackIndex = null);
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text("Не удалось загрузить выбранный трек")),
@@ -563,23 +493,16 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
       return;
     }
 
-    setState(() {
-      _currentMediaItem = items[startIdx];
-      _showMiniPlayer = true;
-      _loadingTrackIndex = null;
-    });
-
-    _refreshDominantColor();
-
     try {
       await audioHandler.ready;
       await audioHandler.setTracksAndPlay(items, startIdx);
     } catch (e) {
       if (!mounted) return;
-      setState(() => _loadingTrackIndex = null);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text("Ошибка воспроизведения: $e")),
       );
+    } finally {
+      if (mounted) setState(() => _loadingTrackIndex = null);
     }
   }
 
@@ -591,8 +514,8 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
         fullscreenDialog: true,
         transitionDuration: const Duration(milliseconds: 400),
         reverseTransitionDuration: const Duration(milliseconds: 400),
-        pageBuilder: (_, __, ___) =>
-            FullPlayerPage(initialDominantColor: _dominantColor),
+        pageBuilder: (_, __, ___) => FullPlayerPage(
+            initialDominantColor: _dominantColorNotifier.value),
         transitionsBuilder: (_, anim, __, child) => SlideTransition(
           position: Tween<Offset>(begin: const Offset(0, 1), end: Offset.zero)
               .animate(CurvedAnimation(parent: anim, curve: Curves.easeOut)),
@@ -605,9 +528,11 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
   @override
   void dispose() {
     _mediaItemSubscription?.cancel();
-    _playbackStateSubscription?.cancel();
+    _playbackErrorsSubscription?.cancel();
     _colorCancelToken?.cancel();
     _pageController.dispose();
+    _mediaItemNotifier.dispose();
+    _dominantColorNotifier.dispose();
     super.dispose();
   }
 
@@ -626,22 +551,26 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                   decoration:
                       BoxDecoration(gradient: ArticTheme.backgroundGradient)),
             ),
-            const RepaintBoundary(
-              child: MatrixBackground(opacity: 0.009, numberOfDrops: 25),
-            ),
+            // Доминант-цвет — только для фона. Обновляется без
+            // перестройки MainScreen.
             RepaintBoundary(
-              child: AnimatedContainer(
-                duration: const Duration(milliseconds: 500),
-                decoration: BoxDecoration(
-                  gradient: RadialGradient(
-                    center: Alignment.center,
-                    radius: 0.8,
-                    colors: [
-                      _dominantColor.withValues(alpha: 0.06),
-                      Colors.transparent,
-                    ],
-                  ),
-                ),
+              child: ValueListenableBuilder<Color>(
+                valueListenable: _dominantColorNotifier,
+                builder: (context, color, _) {
+                  return AnimatedContainer(
+                    duration: const Duration(milliseconds: 500),
+                    decoration: BoxDecoration(
+                      gradient: RadialGradient(
+                        center: Alignment.center,
+                        radius: 0.8,
+                        colors: [
+                          color.withValues(alpha: 0.06),
+                          Colors.transparent,
+                        ],
+                      ),
+                    ),
+                  );
+                },
               ),
             ),
             Column(
@@ -680,44 +609,44 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                   child: PageView(
                     controller: _pageController,
                     physics: const ClampingScrollPhysics(),
+                    allowImplicitScrolling: false,
                     onPageChanged: (index) {
                       setState(() => _currentTab = index);
-                      if (index == 0 &&
-                          DateTime.now()
-                                  .difference(_lastLibraryUpdate)
-                                  .inSeconds >
-                              30) {
-                        _refreshFavorites();
-                      }
                     },
                     children: [
-                      _LibraryTabs(
-                        allTracks: yandexProvider.tracks,
-                        cachedTracks: yandexProvider.cachedTracks,
-                        onSelectAllTrack: _selectTrackFromLibrary,
-                        onSelectCachedTrack: _selectCachedTrack,
-                        isLoading: yandexProvider.isLoading,
-                        loadingIndex: _loadingTrackIndex,
-                        onLongPressTrack: _showTrackOptions,
-                        onRefresh: _refreshFavorites,
-                        onRefreshCached: _refreshCached,
-                        hasInternet: yandexProvider.hasInternet,
-                        onRetry: () {
-                          _refreshFavorites();
-                          setState(() {});
+                      // Селектор по sortMode: пересобирает _LibraryTabs
+                      // только при смене режима сортировки.
+                      Selector<YandexAudioProvider, LibrarySortMode>(
+                        selector: (_, p) => p.sortMode,
+                        builder: (context, sortMode, _) {
+                          return _LibraryTabs(
+                            allTracks: yandexProvider.tracks,
+                            cachedTracks: yandexProvider.cachedTracks,
+                            sortMode: sortMode,
+                            onSortChanged: yandexProvider.setSortMode,
+                            onPlayAll: _playLibraryAll,
+                            onPlayShuffleAll: _playLibraryShuffle,
+                            onSelectAllTrack: _selectTrackFromLibrary,
+                            onSelectCachedTrack: _selectCachedTrack,
+                            isLoading: yandexProvider.isLoading,
+                            loadingIndex: _loadingTrackIndex,
+                            onLongPressTrack: _showTrackOptions,
+                            onRefresh: _refreshFavorites,
+                            onRefreshCached: _refreshCached,
+                            hasInternet: yandexProvider.hasInternet,
+                            onRetry: () {
+                              _refreshFavorites();
+                              setState(() {});
+                            },
+                          );
                         },
                       ),
                       _SearchContent(
-                        onPlay: () {
-                          setState(() {
-                            _showMiniPlayer = true;
-                          });
-                        },
+                        onPlay: () {},
                         onLongPressTrack: _showTrackOptions,
                         onRequestSwitchStart: () {},
                         onRequestSwitchEnd: () {},
-                        currentTrackId:
-                            _currentMediaItem?.extras?['trackId'] as String?,
+                        mediaItemListenable: _mediaItemNotifier,
                       ),
                       const _SettingsContent(),
                     ],
@@ -725,16 +654,14 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                 ),
               ],
             ),
-            if (_showMiniPlayer && _currentMediaItem != null)
-              Positioned(
-                left: kHorizontalPadding,
-                right: kHorizontalPadding,
-                bottom: 8 + bottomPadding,
-                child: const _MiniPlayerHost()
-                    .animate()
-                    .fadeIn(duration: 300.ms)
-                    .slideY(begin: 0.2, end: 0),
-              ),
+            // MiniPlayer рендерится всегда. Внутри сам проверит,
+            // есть ли активный трек, и покажет себя / скроется.
+            Positioned(
+              left: kHorizontalPadding,
+              right: kHorizontalPadding,
+              bottom: 8 + bottomPadding,
+              child: const _MiniPlayerHost(),
+            ),
           ],
         ),
       ),

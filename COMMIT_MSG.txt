@@ -1,0 +1,29 @@
+﻿feat: crossfade, сортировка, play-all, mini-player v2, оптимизация
+
+Полная волна улучшений: UX, производительность, стабильность.
+
+UI / UX:
+- Кроссфейд: плавное затухание в конце трека (0-5 сек), слайдер в Настройках
+- Сортировка библиотеки: по дате / названию / исполнителю, сохраняется в prefs
+- Играть всё / Играть вперемешку в библиотеке
+- Сворачиваемая панель управления в библиотеке (стрелочка справа от табов)
+- Настройки разбиты на секции: Плеер / Интерфейс / Хранилище / Аккаунт
+
+Аудио / Backend:
+- AppAudioHandler: ленивый резолв URL (pending:<trackId>)
+- Стрим playbackErrors -> SnackBar в UI
+- Retry 1 раз (250мс) при ошибке, потом skip
+- Recovery при падении setAudioSource
+- JSON-массив в queue_state, поддержка старого формата при чтении
+- Connectivity-таймер 45с, только при офлайне
+- Crossfade-логика через positionStream (24 шага)
+
+Оптимизация UI:
+- itemExtent: 82 в TrackList
+- ValueNotifier<_TrackUIState> вместо setState в MainScreen
+- Selector<YandexAudioProvider, LibrarySortMode> вокруг _LibraryTabs
+- AutomaticKeepAliveClientMixin на TrackList и SearchContent
+- _depsInitialized флаг для подписок
+
+Известные ограничения:
+- Кроссфейд - fade-out, не перекрёстный (для настоящего нужен dual-player)

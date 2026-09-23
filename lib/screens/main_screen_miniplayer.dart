@@ -1,48 +1,149 @@
 part of 'main_screen.dart';
 
-class _MiniPlayerHost extends StatelessWidget {
+class _MiniPlayerHost extends StatefulWidget {
   const _MiniPlayerHost();
 
   @override
-  Widget build(BuildContext context) {
+  State<_MiniPlayerHost> createState() => _MiniPlayerHostState();
+}
+
+class _MiniPlayerHostState extends State<_MiniPlayerHost> {
+  AppAudioHandler? _handler;
+  StreamSubscription<MediaItem?>? _mediaSub;
+  StreamSubscription<PlaybackState>? _playbackSub;
+
+  MediaItem? _item;
+  bool _isPlaying = false;
+  bool _isLoading = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
     final handler = Provider.of<AppAudioHandler>(context, listen: false);
+    if (_handler == handler && _mediaSub != null) return;
+    _handler = handler;
 
-    return StreamBuilder<MediaItem?>(
-      stream: handler.mediaItem,
-      initialData: handler.mediaItem.value,
-      builder: (context, mediaSnap) {
-        final item = mediaSnap.data;
-        if (item == null) return const SizedBox.shrink();
+    _mediaSub?.cancel();
+    _playbackSub?.cancel();
 
-        return StreamBuilder<PlaybackState>(
-          stream: handler.playbackState,
-          initialData: handler.playbackState.value,
-          builder: (context, psSnap) {
-            final ps = psSnap.data;
-            final isPlaying = ps?.playing ?? false;
-            final isLoading = ps?.processingState == AudioProcessingState.loading ||
-                ps?.processingState == AudioProcessingState.buffering;
+    _item = handler.mediaItem.value;
+    _applyPlayback(handler.playbackState.value);
 
-            return _MiniPlayer(
-              item: item,
-              isPlaying: isPlaying,
-              isLoading: isLoading,
-              onTap: () => _openFullPlayer(context, item),
-              onPlayPause: handler.playOrPause,
-              onNext: handler.skipToNext,
-              onPrevious: handler.skipToPrevious,
-            );
-          },
-        );
-      },
+    _mediaSub = handler.mediaItem.listen((item) {
+      if (!mounted) return;
+      setState(() => _item = item);
+    });
+    _playbackSub = handler.playbackState.listen((ps) {
+      if (!mounted) return;
+      _applyPlayback(ps);
+    });
+  }
+
+  void _applyPlayback(PlaybackState? ps) {
+    final isPlaying = ps?.playing ?? false;
+    final isLoading =
+        ps?.processingState == AudioProcessingState.loading ||
+            ps?.processingState == AudioProcessingState.buffering;
+    if (isPlaying != _isPlaying || isLoading != _isLoading) {
+      setState(() {
+        _isPlaying = isPlaying;
+        _isLoading = isLoading;
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _mediaSub?.cancel();
+    _playbackSub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final handler = _handler;
+    final item = _item;
+    if (handler == null || item == null) return const SizedBox.shrink();
+
+    return _MiniPlayer(
+      item: item,
+      isPlaying: _isPlaying,
+      isLoading: _isLoading,
+      onTap: () => _openFullPlayer(context),
+      onLongPress: () => _showOptions(context, handler),
+      onPlayPause: handler.playOrPause,
+      onNext: handler.skipToNext,
+      onPrevious: handler.skipToPrevious,
     );
   }
 
-  void _openFullPlayer(BuildContext context, MediaItem item) {
+  void _openFullPlayer(BuildContext context) {
     final mainState = context.findAncestorStateOfType<_MainScreenState>();
-    if (mainState != null) {
-      mainState._openFullPlayer();
-    }
+    mainState?._openFullPlayer();
+  }
+
+  void _showOptions(BuildContext context, AppAudioHandler handler) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: ArticTheme.backgroundDarkest,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(
+                'Мини-плеер',
+                style: TextStyle(
+                  color: ArticTheme.primary,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+            ListTile(
+              leading: Icon(Icons.queue_music,
+                  color: ArticTheme.accent, size: 22),
+              title: Text('Открыть очередь',
+                  style: TextStyle(color: ArticTheme.primary)),
+              onTap: () {
+                Navigator.pop(ctx);
+                QueueSheet.show(context);
+              },
+            ),
+            ListTile(
+              leading: Icon(Icons.play_arrow,
+                  color: ArticTheme.accent, size: 22),
+              title: Text('Открыть полный плеер',
+                  style: TextStyle(color: ArticTheme.primary)),
+              onTap: () {
+                Navigator.pop(ctx);
+                _openFullPlayer(context);
+              },
+            ),
+            ListTile(
+              leading: Icon(Icons.clear_all,
+                  color: Colors.redAccent, size: 22),
+              title: Text('Очистить очередь',
+                  style: TextStyle(color: Colors.redAccent)),
+              onTap: () async {
+                Navigator.pop(ctx);
+                await handler.clearQueue();
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Очередь очищена')),
+                  );
+                }
+              },
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
   }
 }
 
@@ -51,6 +152,7 @@ class _MiniPlayer extends StatefulWidget {
   final bool isPlaying;
   final bool isLoading;
   final VoidCallback onTap;
+  final VoidCallback onLongPress;
   final Future<void> Function() onPlayPause;
   final Future<void> Function() onNext;
   final Future<void> Function() onPrevious;
@@ -60,6 +162,7 @@ class _MiniPlayer extends StatefulWidget {
     required this.isPlaying,
     required this.isLoading,
     required this.onTap,
+    required this.onLongPress,
     required this.onPlayPause,
     required this.onNext,
     required this.onPrevious,
@@ -80,6 +183,12 @@ class __MiniPlayerState extends State<_MiniPlayer>
   static const Duration _skipThrottle = Duration(milliseconds: 250);
   static const Duration _playPauseThrottle = Duration(milliseconds: 150);
 
+  static const double _coverSize = 46.0;
+  static const double _buttonSize = 36.0;
+  static const double _barHeight = 4.0;
+  static const double _cornerRadius = 14.0;
+  static const double _buttonInset = 6.0;
+
   @override
   void initState() {
     super.initState();
@@ -87,7 +196,6 @@ class __MiniPlayerState extends State<_MiniPlayer>
       vsync: this,
       duration: const Duration(milliseconds: 800),
     );
-    // Pulse только при playing
     if (widget.isPlaying) {
       _pulseController.repeat(reverse: true);
     }
@@ -159,44 +267,74 @@ class __MiniPlayerState extends State<_MiniPlayer>
 
   @override
   Widget build(BuildContext context) {
-    // НЕТ BackdropFilter, НЕТ ClipRRect на корне — они глушат hit-test.
-    // GestureDetector только для drag, без onTap, чтобы не конкурировать с InkWell.
+    final rightReserved = _buttonSize + _buttonInset + 4;
+
     return GestureDetector(
       behavior: HitTestBehavior.deferToChild,
       onHorizontalDragEnd: _onHorizontalDrag,
       child: Container(
         decoration: BoxDecoration(
           gradient: ArticTheme.surfaceGradient,
-          borderRadius: BorderRadius.circular(22),
-          border: Border.all(
-            color: ArticTheme.accent.withValues(alpha: 0.35),
-            width: 0.6,
+          borderRadius: BorderRadius.circular(_cornerRadius),
+          border: Border(
+            top: BorderSide(
+              color: ArticTheme.accent.withValues(alpha: 0.35),
+              width: 0.6,
+            ),
+            left: BorderSide(
+              color: ArticTheme.accent.withValues(alpha: 0.35),
+              width: 0.6,
+            ),
+            right: BorderSide(
+              color: ArticTheme.accent.withValues(alpha: 0.35),
+              width: 0.6,
+            ),
           ),
-          boxShadow: ArticTheme.glow(radius: 14),
         ),
         child: Material(
           type: MaterialType.transparency,
-          child: InkWell(
-            borderRadius: BorderRadius.circular(22),
-            onTap: widget.onTap,
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(10, 8, 6, 0),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(_cornerRadius),
+            child: InkWell(
+              onTap: widget.onTap,
+              onLongPress: widget.onLongPress,
+              child: Stack(
                 children: [
-                  Row(
-                    children: [
-                      _buildCover(),
-                      const SizedBox(width: 12),
-                      _buildTrackInfo(),
-                      const SizedBox(width: 6),
-                      _buildPrevButton(),
-                      _buildPlayButton(),
-                      _buildNextButton(),
-                    ],
+                  Padding(
+                    padding: EdgeInsets.fromLTRB(
+                      8,
+                      8,
+                      8,
+                      14 + _barHeight,
+                    ),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.center,
+                      children: [
+                        _buildCover(),
+                        const SizedBox(width: 12),
+                        Expanded(child: _buildTrackText()),
+                        SizedBox(width: rightReserved),
+                      ],
+                    ),
                   ),
-                  const SizedBox(height: 2),
-                  const _MiniPlayerProgress(),
+                  Positioned(
+                    top: _buttonInset,
+                    right: _buttonInset,
+                    child: _buildPlayButton(),
+                  ),
+                  Positioned(
+                    left: 12,
+                    right: 12,
+                    bottom: _barHeight + 2,
+                    child: const _MiniPlayerTimeLabels(),
+                  ),
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    height: _barHeight,
+                    child: const _MiniPlayerProgressLine(),
+                  ),
                 ],
               ),
             ),
@@ -210,23 +348,23 @@ class __MiniPlayerState extends State<_MiniPlayer>
     final cover = widget.item.artUri?.toString() ?? '';
     return Container(
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(10),
         boxShadow: [
           BoxShadow(
-            color: ArticTheme.accent.withValues(alpha: 0.25),
-            blurRadius: 10,
-            spreadRadius: 1,
+            color: ArticTheme.accent.withValues(alpha: 0.22),
+            blurRadius: 6,
+            spreadRadius: 0.5,
           ),
         ],
       ),
       child: ClipRRect(
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(10),
         child: cover.isEmpty
             ? _placeholderCover()
             : CachedNetworkImage(
                 imageUrl: cover,
-                width: 46,
-                height: 46,
+                width: _coverSize,
+                height: _coverSize,
                 fit: BoxFit.cover,
                 memCacheWidth: 92,
                 memCacheHeight: 92,
@@ -239,138 +377,86 @@ class __MiniPlayerState extends State<_MiniPlayer>
 
   Widget _placeholderCover() {
     return Container(
-      width: 46,
-      height: 46,
+      width: _coverSize,
+      height: _coverSize,
       color: Colors.white10,
       child: const Icon(Icons.music_note, color: Colors.white38, size: 22),
     );
   }
 
-  Widget _buildTrackInfo() {
-    return Expanded(
-      child: AnimatedSwitcher(
-        duration: const Duration(milliseconds: 220),
-        transitionBuilder: (child, animation) => FadeTransition(
-          opacity: animation,
-          child: SlideTransition(
-            position: Tween<Offset>(
-              begin: const Offset(0.06, 0),
-              end: Offset.zero,
-            ).animate(animation),
-            child: child,
-          ),
-        ),
-        child: Column(
-          key: ValueKey(widget.item.id),
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              widget.item.title,
-              style: TextStyle(
-                color: ArticTheme.primary,
-                fontWeight: FontWeight.w600,
-                fontSize: 14,
-                letterSpacing: 0.2,
-              ),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-            const SizedBox(height: 2),
-            Text(
-              widget.item.artist ?? '',
-              style: TextStyle(
-                color: ArticTheme.secondary,
-                fontSize: 12,
-              ),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-          ],
+  Widget _buildTrackText() {
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 220),
+      switchInCurve: Curves.easeOut,
+      switchOutCurve: Curves.easeIn,
+      transitionBuilder: (child, animation) => FadeTransition(
+        opacity: animation,
+        child: SlideTransition(
+          position: Tween<Offset>(
+            begin: const Offset(0.06, 0),
+            end: Offset.zero,
+          ).animate(animation),
+          child: child,
         ),
       ),
-    );
-  }
-
-  Widget _buildPrevButton() {
-    return SizedBox(
-      width: 36,
-      height: 36,
-      child: Material(
-        type: MaterialType.transparency,
-        child: InkWell(
-          customBorder: const CircleBorder(),
-          onTap: _handlePrev,
-          child: Container(
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              border: Border.all(
-                color: ArticTheme.accent.withValues(alpha: 0.4),
-                width: 1.0,
-              ),
+      child: Column(
+        key: ValueKey('mini_${widget.item.id}'),
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          Text(
+            widget.item.title,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: ArticTheme.primary,
+              fontWeight: FontWeight.w600,
+              fontSize: 15,
+              letterSpacing: 0.2,
             ),
-            child: Icon(
-              Icons.skip_previous,
-              color: ArticTheme.primary.withValues(alpha: 0.85),
-              size: 20,
-            ),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
           ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildNextButton() {
-    return SizedBox(
-      width: 36,
-      height: 36,
-      child: Material(
-        type: MaterialType.transparency,
-        child: InkWell(
-          customBorder: const CircleBorder(),
-          onTap: _handleNext,
-          child: Container(
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              border: Border.all(
-                color: ArticTheme.accent.withValues(alpha: 0.4),
-                width: 1.0,
-              ),
+          const SizedBox(height: 1),
+          Text(
+            widget.item.artist ?? '',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: ArticTheme.secondary,
+              fontSize: 12,
+              fontWeight: FontWeight.w500,
             ),
-            child: Icon(
-              Icons.skip_next,
-              color: ArticTheme.primary.withValues(alpha: 0.85),
-              size: 20,
-            ),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
           ),
-        ),
+        ],
       ),
     );
   }
 
   Widget _buildPlayButton() {
-    // Кнопка ВСЕГДА кликабельна. Loader — overlay под IgnorePointer.
     return SizedBox(
-      width: 44,
-      height: 44,
+      width: _buttonSize,
+      height: _buttonSize,
       child: Stack(
         alignment: Alignment.center,
         children: [
-          // Пульсирующий фон (не мешает тапу)
           IgnorePointer(
             child: AnimatedBuilder(
               animation: _pulseController,
               builder: (context, child) {
-                final scale = 1.0 + 0.08 * _pulseController.value;
+                final scale = 1.0 + 0.20 * _pulseController.value;
                 return Transform.scale(
                   scale: widget.isPlaying ? scale : 1.0,
                   child: Container(
-                    width: 44,
-                    height: 44,
+                    width: _buttonSize,
+                    height: _buttonSize,
                     decoration: BoxDecoration(
                       shape: BoxShape.circle,
-                      color: ArticTheme.accent.withValues(
-                        alpha: 0.15 * _pulseController.value,
+                      border: Border.all(
+                        color: ArticTheme.accent.withValues(
+                          alpha: 0.35 * _pulseController.value,
+                        ),
+                        width: 1.0,
                       ),
                     ),
                   ),
@@ -378,14 +464,16 @@ class __MiniPlayerState extends State<_MiniPlayer>
               },
             ),
           ),
-          // Кнопка
           Container(
-            width: 42,
-            height: 42,
+            width: _buttonSize,
+            height: _buttonSize,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
-              gradient: ArticTheme.accentGradient,
-              boxShadow: ArticTheme.glow(radius: 12),
+              color: Colors.transparent,
+              border: Border.all(
+                color: ArticTheme.accent.withValues(alpha: 0.85),
+                width: 1.3,
+              ),
             ),
             child: Material(
               type: MaterialType.transparency,
@@ -397,28 +485,28 @@ class __MiniPlayerState extends State<_MiniPlayer>
                       ? Icons.pause_rounded
                       : Icons.play_arrow_rounded,
                   color: ArticTheme.primary,
-                  size: 24,
+                  size: 19,
                 ),
               ),
             ),
           ),
-          // Лоадер поверх — не блокирует тап
           if (widget.isLoading)
             IgnorePointer(
               child: Container(
-                width: 42,
-                height: 42,
+                width: _buttonSize,
+                height: _buttonSize,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
-                  color: ArticTheme.backgroundDeep.withValues(alpha: 0.7),
+                  color: ArticTheme.backgroundDeep.withValues(alpha: 0.6),
                 ),
                 child: const Center(
                   child: SizedBox(
-                    width: 20,
-                    height: 20,
+                    width: 14,
+                    height: 14,
                     child: CircularProgressIndicator(
-                      strokeWidth: 2.5,
-                      valueColor: AlwaysStoppedAnimation<Color>(Colors.white70),
+                      strokeWidth: 2.0,
+                      valueColor:
+                          AlwaysStoppedAnimation<Color>(Colors.white70),
                     ),
                   ),
                 ),
@@ -430,12 +518,12 @@ class __MiniPlayerState extends State<_MiniPlayer>
   }
 }
 
-class _MiniPlayerProgress extends StatelessWidget {
-  const _MiniPlayerProgress();
+class _MiniPlayerProgressLine extends StatelessWidget {
+  const _MiniPlayerProgressLine();
 
   @override
   Widget build(BuildContext context) {
-    final handler = Provider.of<AppAudioHandler>(context);
+    final handler = Provider.of<AppAudioHandler>(context, listen: false);
     return StreamBuilder<Duration>(
       stream: handler.positionStream,
       builder: (context, posSnap) {
@@ -444,13 +532,18 @@ class _MiniPlayerProgress extends StatelessWidget {
           stream: handler.durationStream,
           builder: (context, durSnap) {
             final duration = durSnap.data ?? Duration.zero;
-            final progress = duration.inSeconds > 0
-                ? (position.inSeconds / duration.inSeconds).clamp(0.0, 1.0)
+            final progress = duration.inMilliseconds > 0
+                ? (position.inMilliseconds / duration.inMilliseconds)
+                    .clamp(0.0, 1.0)
                 : 0.0;
-            return _ProgressBar(
-              currentPosition: position,
-              duration: duration,
-              progress: progress,
+            return CustomPaint(
+              painter: _CenterProgressPainter(
+                progress: progress,
+                background: ArticTheme.secondary.withValues(alpha: 0.20),
+                fill: ArticTheme.accent,
+                glow: ArticTheme.accent.withValues(alpha: 0.55),
+              ),
+              size: Size.infinite,
             );
           },
         );
@@ -459,95 +552,97 @@ class _MiniPlayerProgress extends StatelessWidget {
   }
 }
 
-class _ProgressBar extends StatelessWidget {
-  final Duration currentPosition;
-  final Duration duration;
-  final double progress;
+class _MiniPlayerTimeLabels extends StatelessWidget {
+  const _MiniPlayerTimeLabels();
 
-  const _ProgressBar({
-    required this.currentPosition,
-    required this.duration,
-    required this.progress,
-  });
+  static const TextStyle _style = TextStyle(
+    fontSize: 9,
+    fontFamily: 'StieglitzSP',
+    color: Colors.white60,
+    letterSpacing: 0.3,
+  );
 
-  String _formatTime(Duration d) {
-    final minutes = d.inMinutes.remainder(60).toString().padLeft(2, '0');
-    final seconds = d.inSeconds.remainder(60).toString().padLeft(2, '0');
-    return "$minutes:$seconds";
+  String _fmt(Duration d) {
+    if (d == Duration.zero) return '--:--';
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return '$m:$s';
   }
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(6, 6, 6, 8),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.center,
-        children: [
-          SizedBox(
-            width: 32,
-            child: Text(
-              _formatTime(currentPosition),
-              style: TextStyle(
-                fontSize: 9,
-                fontFamily: 'StieglitzSP',
-                color: ArticTheme.secondary.withValues(alpha: 0.7),
-              ),
-            ),
-          ),
-          Expanded(
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 6),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(2),
-                child: SizedBox(
-                  height: 3,
-                  child: Stack(
-                    children: [
-                      Container(
-                        color: ArticTheme.secondary.withValues(alpha: 0.18),
-                      ),
-                      FractionallySizedBox(
-                        widthFactor: progress.clamp(0.0, 1.0),
-                        alignment: Alignment.centerLeft,
-                        child: Container(
-                          decoration: BoxDecoration(
-                            gradient: ArticTheme.accentGradient,
-                            borderRadius: BorderRadius.circular(2),
-                            boxShadow: [
-                              BoxShadow(
-                                color: ArticTheme.accent.withValues(alpha: 0.5),
-                                blurRadius: 4,
-                                spreadRadius: 0.5,
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ),
-          SizedBox(
-            width: 32,
-            child: Text(
-              _formatDuration(duration),
-              textAlign: TextAlign.right,
-              style: TextStyle(
-                fontSize: 9,
-                fontFamily: 'StieglitzSP',
-                color: ArticTheme.secondary.withValues(alpha: 0.7),
-              ),
-            ),
-          ),
-        ],
-      ),
+    final handler = Provider.of<AppAudioHandler>(context, listen: false);
+    return StreamBuilder<Duration>(
+      stream: handler.positionStream,
+      builder: (context, posSnap) {
+        final position = posSnap.data ?? Duration.zero;
+        return StreamBuilder<Duration>(
+          stream: handler.durationStream,
+          builder: (context, durSnap) {
+            final duration = durSnap.data ?? Duration.zero;
+            return Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(_fmt(position), style: _style),
+                Text(_fmt(duration), style: _style),
+              ],
+            );
+          },
+        );
+      },
     );
   }
+}
 
-  String _formatDuration(Duration d) {
-    if (d == Duration.zero) return '--:--';
-    return _formatTime(d);
+class _CenterProgressPainter extends CustomPainter {
+  final double progress;
+  final Color background;
+  final Color fill;
+  final Color glow;
+
+  _CenterProgressPainter({
+    required this.progress,
+    required this.background,
+    required this.fill,
+    required this.glow,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (size.width <= 0 || size.height <= 0) return;
+
+    canvas.drawRect(
+      Rect.fromLTWH(0, 0, size.width, size.height),
+      Paint()..color = background,
+    );
+
+    final p = progress.clamp(0.0, 1.0);
+    if (p <= 0) return;
+
+    final centerX = size.width / 2;
+    final halfWidth = (size.width / 2) * p;
+
+    final rect = Rect.fromLTWH(
+      centerX - halfWidth,
+      0,
+      halfWidth * 2,
+      size.height,
+    );
+
+    canvas.drawRect(
+      rect,
+      Paint()
+        ..color = glow
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 4),
+    );
+
+    canvas.drawRect(rect, Paint()..color = fill);
   }
+
+  @override
+  bool shouldRepaint(covariant _CenterProgressPainter old) =>
+      old.progress != progress ||
+      old.fill != fill ||
+      old.background != background ||
+      old.glow != glow;
 }
