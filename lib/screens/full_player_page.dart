@@ -11,6 +11,7 @@ import '../theme/artic_theme.dart';
 import '../services/audio_handler.dart';
 import '../services/yandex/yandex_audio_provider.dart';
 import '../utils/color_utils.dart';
+import 'queue_sheet.dart';
 
 class FullPlayerPage extends StatefulWidget {
   final Color initialDominantColor;
@@ -305,6 +306,11 @@ class _FullPlayerPageState extends State<FullPlayerPage>
           icon: _loopIcon(),
           color: ArticTheme.primary,
           onPressed: _toggleLoopMode,
+        ),
+        _NeonIconButton(
+          icon: Icons.queue_music,
+          color: ArticTheme.primary,
+          onPressed: () => QueueSheet.show(context),
         ),
         _NeonIconButton(
           icon: Icons.lyrics,

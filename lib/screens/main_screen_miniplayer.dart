@@ -1,32 +1,88 @@
 part of 'main_screen.dart';
 
+/// Хост mini-player'а — сам подписывается на потоки handler'а.
+/// Родитель передаёт только onTap (открыть full player).
+class _MiniPlayerHost extends StatelessWidget {
+  const _MiniPlayerHost();
+
+  @override
+  Widget build(BuildContext context) {
+    final handler = Provider.of<AppAudioHandler>(context, listen: false);
+
+    return StreamBuilder<MediaItem?>(
+      stream: handler.mediaItem,
+      initialData: handler.mediaItem.value,
+      builder: (context, mediaSnap) {
+        final item = mediaSnap.data;
+        if (item == null) return const SizedBox.shrink();
+
+        return StreamBuilder<PlaybackState>(
+          stream: handler.playbackState,
+          initialData: handler.playbackState.value,
+          builder: (context, psSnap) {
+            final ps = psSnap.data;
+            final isPlaying = ps?.playing ?? false;
+            final isLoading = ps?.processingState == AudioProcessingState.loading ||
+                ps?.processingState == AudioProcessingState.buffering;
+
+            return _MiniPlayer(
+              item: item,
+              isPlaying: isPlaying,
+              isLoading: isLoading,
+              onTap: () => _openFullPlayer(context, item),
+              onPlayPause: handler.playOrPause,
+              onNext: handler.skipToNext,
+              onPrevious: handler.skipToPrevious,
+            );
+          },
+        );
+      },
+    );
+  }
+
+  void _openFullPlayer(BuildContext context, MediaItem item) {
+    final mainState = context.findAncestorStateOfType<_MainScreenState>();
+    if (mainState != null) {
+      mainState._openFullPlayer();
+    }
+  }
+}
+
 class _MiniPlayer extends StatefulWidget {
-  final Map<String, String> track;
-  final VoidCallback onTap;
-  final VoidCallback onPlayPause;
-  final VoidCallback onNext;
-  final VoidCallback onPrevious;
+  final MediaItem item;
   final bool isPlaying;
   final bool isLoading;
+  final VoidCallback onTap;
+  final Future<void> Function() onPlayPause;
+  final Future<void> Function() onNext;
+  final Future<void> Function() onPrevious;
 
   const _MiniPlayer({
-    required this.track,
+    required this.item,
+    required this.isPlaying,
+    required this.isLoading,
     required this.onTap,
     required this.onPlayPause,
     required this.onNext,
     required this.onPrevious,
-    required this.isPlaying,
-    required this.isLoading,
   });
 
   @override
   State<_MiniPlayer> createState() => __MiniPlayerState();
 }
 
-class __MiniPlayerState extends State<_MiniPlayer> with SingleTickerProviderStateMixin {
+class __MiniPlayerState extends State<_MiniPlayer>
+    with SingleTickerProviderStateMixin {
   late AnimationController _pulseController;
-  
   bool _isDisposed = false;
+
+  // Throttle: не чаще, чем раз в 350мс для next/prev
+  DateTime? _lastSkipAt;
+  static const Duration _skipThrottle = Duration(milliseconds: 350);
+
+  // То же для паузы
+  DateTime? _lastPlayPauseAt;
+  static const Duration _playPauseThrottle = Duration(milliseconds: 200);
 
   @override
   void initState() {
@@ -44,6 +100,43 @@ class __MiniPlayerState extends State<_MiniPlayer> with SingleTickerProviderStat
     super.dispose();
   }
 
+  void _safeHaptic() {
+    try {
+      HapticFeedback.lightImpact();
+    } catch (_) {}
+  }
+
+  Future<void> _handleNext() async {
+    final now = DateTime.now();
+    if (_lastSkipAt != null && now.difference(_lastSkipAt!) < _skipThrottle) {
+      return;
+    }
+    _lastSkipAt = now;
+    _safeHaptic();
+    await widget.onNext();
+  }
+
+  Future<void> _handlePrevious() async {
+    final now = DateTime.now();
+    if (_lastSkipAt != null && now.difference(_lastSkipAt!) < _skipThrottle) {
+      return;
+    }
+    _lastSkipAt = now;
+    _safeHaptic();
+    await widget.onPrevious();
+  }
+
+  Future<void> _handlePlayPause() async {
+    final now = DateTime.now();
+    if (_lastPlayPauseAt != null &&
+        now.difference(_lastPlayPauseAt!) < _playPauseThrottle) {
+      return;
+    }
+    _lastPlayPauseAt = now;
+    _safeHaptic();
+    await widget.onPlayPause();
+  }
+
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
@@ -51,16 +144,10 @@ class __MiniPlayerState extends State<_MiniPlayer> with SingleTickerProviderStat
       onHorizontalDragEnd: (details) {
         final velocity = details.primaryVelocity ?? 0;
         if (velocity.abs() > 100) {
-          try {
-            HapticFeedback.lightImpact();
-          } catch (e) {
-            debugPrint('Haptic feedback error: $e');
-          }
-          
           if (velocity > 0) {
-            widget.onPrevious();
-          } else if (velocity < 0) {
-            widget.onNext();
+            _handlePrevious();
+          } else {
+            _handleNext();
           }
         }
       },
@@ -81,7 +168,8 @@ class __MiniPlayerState extends State<_MiniPlayer> with SingleTickerProviderStat
               mainAxisSize: MainAxisSize.min,
               children: [
                 Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                   child: Row(
                     children: [
                       _buildCover(),
@@ -91,7 +179,7 @@ class __MiniPlayerState extends State<_MiniPlayer> with SingleTickerProviderStat
                     ],
                   ),
                 ),
-                const _MiniPlayerProgress(), // Обновлённый виджет прогресса
+                const _MiniPlayerProgress(),
               ],
             ),
           ),
@@ -101,25 +189,37 @@ class __MiniPlayerState extends State<_MiniPlayer> with SingleTickerProviderStat
   }
 
   Widget _buildCover() {
+    final cover = widget.item.artUri?.toString() ?? '';
     return ClipRRect(
       borderRadius: BorderRadius.circular(14),
-      child: CachedNetworkImage(
-        imageUrl: widget.track["cover"] ?? '',
-        width: 48,
-        height: 48,
-        fit: BoxFit.cover,
-        memCacheWidth: 96,
-        memCacheHeight: 96,
-        placeholder: (_, __) => const _MusicPlaceholder(),
-        errorWidget: (_, __, ___) => const _MusicPlaceholder(),
-      ),
+      child: cover.isEmpty
+          ? _placeholderCover()
+          : CachedNetworkImage(
+              imageUrl: cover,
+              width: 48,
+              height: 48,
+              fit: BoxFit.cover,
+              memCacheWidth: 96,
+              memCacheHeight: 96,
+              placeholder: (_, __) => _placeholderCover(),
+              errorWidget: (_, __, ___) => _placeholderCover(),
+            ),
+    );
+  }
+
+  Widget _placeholderCover() {
+    return Container(
+      width: 48,
+      height: 48,
+      color: Colors.white10,
+      child: const Icon(Icons.music_note, color: Colors.white38),
     );
   }
 
   Widget _buildTrackInfo() {
     return Expanded(
       child: AnimatedSwitcher(
-        duration: const Duration(milliseconds: 300),
+        duration: const Duration(milliseconds: 250),
         transitionBuilder: (child, animation) => FadeTransition(
           opacity: animation,
           child: SlideTransition(
@@ -131,11 +231,11 @@ class __MiniPlayerState extends State<_MiniPlayer> with SingleTickerProviderStat
           ),
         ),
         child: Column(
-          key: ValueKey(widget.track["title"]),
+          key: ValueKey(widget.item.id),
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              widget.track["title"] ?? '',
+              widget.item.title,
               style: TextStyle(
                 color: ArticTheme.primary,
                 fontWeight: FontWeight.w600,
@@ -145,7 +245,7 @@ class __MiniPlayerState extends State<_MiniPlayer> with SingleTickerProviderStat
               overflow: TextOverflow.ellipsis,
             ),
             Text(
-              widget.track["artist"] ?? '',
+              widget.item.artist ?? '',
               style: TextStyle(
                 color: ArticTheme.secondary,
                 fontSize: 13,
@@ -165,14 +265,14 @@ class __MiniPlayerState extends State<_MiniPlayer> with SingleTickerProviderStat
       children: [
         _buildControlButton(
           icon: Icons.skip_previous,
-          onTap: widget.onPrevious,
+          onTap: _handlePrevious,
         ),
         const SizedBox(width: 4),
         _buildPlayButton(),
         const SizedBox(width: 4),
         _buildControlButton(
           icon: Icons.skip_next,
-          onTap: widget.onNext,
+          onTap: _handleNext,
         ),
       ],
     );
@@ -180,17 +280,11 @@ class __MiniPlayerState extends State<_MiniPlayer> with SingleTickerProviderStat
 
   Widget _buildControlButton({
     required IconData icon,
-    required VoidCallback onTap,
+    required Future<void> Function() onTap,
   }) {
     return GestureDetector(
-      onTap: () {
-        try {
-          HapticFeedback.lightImpact();
-        } catch (e) {
-          debugPrint('Haptic feedback error: $e');
-        }
-        onTap();
-      },
+      onTap: onTap,
+      behavior: HitTestBehavior.opaque,
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 6),
         child: Icon(
@@ -203,54 +297,48 @@ class __MiniPlayerState extends State<_MiniPlayer> with SingleTickerProviderStat
   }
 
   Widget _buildPlayButton() {
-    if (widget.isLoading && widget.track['trackId'] != null && widget.track['trackId']!.isNotEmpty) {
+    if (widget.isLoading) {
       return const SizedBox(
         width: 44,
         height: 44,
-        child: CircularProgressIndicator(
-          strokeWidth: 3,
-          valueColor: AlwaysStoppedAnimation<Color>(Colors.white70),
+        child: Padding(
+          padding: EdgeInsets.all(8),
+          child: CircularProgressIndicator(
+            strokeWidth: 3,
+            valueColor: AlwaysStoppedAnimation<Color>(Colors.white70),
+          ),
         ),
       );
     }
 
     return GestureDetector(
-      onTap: () {
-        try {
-          HapticFeedback.lightImpact();
-        } catch (e) {
-          debugPrint('Haptic feedback error: $e');
-        }
-        widget.onPlayPause();
-      },
+      onTap: _handlePlayPause,
+      behavior: HitTestBehavior.opaque,
       child: AnimatedBuilder(
         animation: _pulseController,
         builder: (context, child) {
           final scale = 1.0 + 0.06 * _pulseController.value;
-          return Transform.scale(
-            scale: scale,
-            child: Container(
-              width: 44,
-              height: 44,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                gradient: ArticTheme.accentGradient,
-                boxShadow: ArticTheme.glow(radius: 16),
-              ),
-              child: Icon(
-                widget.isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
-                color: ArticTheme.primary,
-                size: 26,
-              ),
-            ),
-          );
+          return Transform.scale(scale: scale, child: child);
         },
+        child: Container(
+          width: 44,
+          height: 44,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            gradient: ArticTheme.accentGradient,
+            boxShadow: ArticTheme.glow(radius: 16),
+          ),
+          child: Icon(
+            widget.isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
+            color: ArticTheme.primary,
+            size: 26,
+          ),
+        ),
       ),
     );
   }
 }
 
-// Новый виджет для прогресс-бара, обновляющийся только через StreamBuilder
 class _MiniPlayerProgress extends StatelessWidget {
   const _MiniPlayerProgress();
 
@@ -321,6 +409,7 @@ class _ProgressBar extends StatelessWidget {
               ),
               child: FractionallySizedBox(
                 widthFactor: progress,
+                alignment: Alignment.centerLeft,
                 child: Container(
                   decoration: BoxDecoration(
                     gradient: ArticTheme.accentGradient,
@@ -331,7 +420,7 @@ class _ProgressBar extends StatelessWidget {
             ),
           ),
           Text(
-            _formatTime(duration),
+            _formatDuration(duration),
             style: TextStyle(
               fontSize: 9,
               fontFamily: 'StieglitzSP',
@@ -341,5 +430,10 @@ class _ProgressBar extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  String _formatDuration(Duration d) {
+    if (d == Duration.zero) return '--:--';
+    return _formatTime(d);
   }
 }

@@ -16,6 +16,9 @@ import '../services/yandex/yandex_auth_service.dart';
 import '../utils/matrix_background.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../theme/theme_notifier.dart';
+import 'storage_manager_screen.dart';
+import 'downloads_screen.dart';
+import 'history_screen.dart';
 
 part 'main_screen_library.dart';
 part 'main_screen_miniplayer.dart';
@@ -43,12 +46,15 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
   Color _dominantColor = ArticTheme.accent;
   CancelToken? _colorCancelToken;
   MediaItem? _currentMediaItem;
-  DateTime _lastLibraryUpdate = DateTime.now().subtract(const Duration(minutes: 1));
-  DateTime _lastCacheUpdate = DateTime.now().subtract(const Duration(minutes: 1));
+  String? _lastDominantColorCover;
+  DateTime _lastLibraryUpdate =
+      DateTime.now().subtract(const Duration(minutes: 1));
+  DateTime _lastCacheUpdate =
+      DateTime.now().subtract(const Duration(minutes: 1));
 
-  bool _isSwitchingTrack = false;
-
-  final PageStorageKey _libraryScrollKey = const PageStorageKey('library_list');
+  // Кэшируем последнее состояние, чтобы не дёргать setState впустую
+  bool? _lastPlaying;
+  AudioProcessingState? _lastProcessingState;
 
   StreamSubscription<MediaItem?>? _mediaItemSubscription;
   StreamSubscription<PlaybackState>? _playbackStateSubscription;
@@ -65,34 +71,53 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
     audioHandler = Provider.of<AppAudioHandler>(context);
     yandexProvider = Provider.of<YandexAudioProvider>(context);
 
-    // Инициализация провайдера УЖЕ выполнена в SplashScreen,
-    // поэтому здесь не вызываем yandexProvider.init()
-
     _mediaItemSubscription = audioHandler.mediaItem.listen(_onMediaItemChanged);
-    _playbackStateSubscription = audioHandler.playbackState.listen(_onPlaybackStateChanged);
-
-    _refreshDominantColor();
+    _playbackStateSubscription =
+        audioHandler.playbackState.listen(_onPlaybackStateChanged);
 
     final mediaItem = audioHandler.mediaItem.value;
-    if (audioHandler.playbackState.value.playing && mediaItem != null) {
-      setState(() {
-        _currentMediaItem = mediaItem;
-        _showMiniPlayer = true;
-      });
+    final ps = audioHandler.playbackState.value;
+    _lastPlaying = ps.playing;
+    _lastProcessingState = ps.processingState;
+
+    if (mediaItem != null) {
+      _currentMediaItem = mediaItem;
+      _showMiniPlayer = true;
+      _refreshDominantColor();
     }
   }
 
   void _onMediaItemChanged(MediaItem? mediaItem) {
-    if (mediaItem == null) return;
-    if (_isSwitchingTrack) return;
+    if (mediaItem == null) {
+      if (_currentMediaItem != null) {
+        setState(() {
+          _currentMediaItem = null;
+          _showMiniPlayer = false;
+        });
+      }
+      return;
+    }
+
+    final changed = _currentMediaItem?.id != mediaItem.id;
     setState(() {
       _currentMediaItem = mediaItem;
       _showMiniPlayer = true;
     });
-    _refreshDominantColor();
+
+    if (changed) _refreshDominantColor();
   }
 
   void _onPlaybackStateChanged(PlaybackState state) {
+    if (!mounted) return;
+
+    final playingChanged = _lastPlaying != state.playing;
+    final processingChanged = _lastProcessingState != state.processingState;
+
+    if (!playingChanged && !processingChanged) return;
+
+    _lastPlaying = state.playing;
+    _lastProcessingState = state.processingState;
+
     setState(() {});
     if (state.playing && _currentMediaItem != null && !_showMiniPlayer) {
       setState(() => _showMiniPlayer = true);
@@ -104,6 +129,9 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
     if (currentTrack == null) return;
     final coverUrl = currentTrack.artUri?.toString();
     if (coverUrl == null || coverUrl.isEmpty) return;
+    if (coverUrl == _lastDominantColorCover) return;
+    _lastDominantColorCover = coverUrl;
+
     _colorCancelToken?.cancel();
     _colorCancelToken = CancelToken();
     final color = await ColorUtils.extractDominantColor(
@@ -127,7 +155,8 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
     setState(() => _currentTab = newTab);
     _pageController.animateToPage(newTab,
         duration: const Duration(milliseconds: 250), curve: Curves.easeOutCubic);
-    if (newTab == 0 && DateTime.now().difference(_lastLibraryUpdate).inSeconds > 30) {
+    if (newTab == 0 &&
+        DateTime.now().difference(_lastLibraryUpdate).inSeconds > 30) {
       _refreshFavorites();
     }
   }
@@ -143,9 +172,9 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
   }
 
   // ========== ФОРМИРОВАНИЕ ОЧЕРЕДИ ИЗ ДИАЛОГА ==========
-  Future<void> _playTracksFromDialog(List<Map<String, String>> tracks, int selectedIndex) async {
+  Future<void> _playTracksFromDialog(
+      List<Map<String, String>> tracks, int selectedIndex) async {
     if (!mounted) return;
-    setState(() => _isSwitchingTrack = true);
 
     final futures = tracks.map((track) async {
       final trackId = track['trackId']!;
@@ -164,7 +193,6 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
     final items = (await Future.wait(futures)).whereType<MediaItem>().toList();
 
     if (!mounted) return;
-    setState(() => _isSwitchingTrack = false);
 
     if (items.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -174,7 +202,8 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
     }
 
     final selectedTrackId = tracks[selectedIndex]['trackId']!;
-    final startIdx = items.indexWhere((item) => item.extras?['trackId'] == selectedTrackId);
+    final startIdx =
+        items.indexWhere((item) => item.extras?['trackId'] == selectedTrackId);
     if (startIdx == -1) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text("Не удалось загрузить выбранный трек")),
@@ -197,6 +226,8 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
     final isPinned = track["cached"] == "true";
 
     final options = <String>[];
+    options.add("Играть следующим");
+    options.add("В конец очереди");
     if (isFavorite) {
       options.add("Удалить из избранного");
     } else {
@@ -220,27 +251,74 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
       builder: (context) => SafeArea(
         child: Column(
           mainAxisSize: MainAxisSize.min,
-          children: options.map((opt) => ListTile(
-            title: Text(opt, style: TextStyle(color: ArticTheme.primary)),
-            onTap: () => Navigator.pop(context, opt),
-          )).toList(),
+          children: options
+              .map((opt) => ListTile(
+                    title:
+                        Text(opt, style: TextStyle(color: ArticTheme.primary)),
+                    onTap: () => Navigator.pop(context, opt),
+                  ))
+              .toList(),
         ),
       ),
     );
 
     if (result == null) return;
 
-    if (result == "Добавить в избранное") {
+    if (result == "Играть следующим") {
+      final url = await yandexProvider.getDirectUrl(trackId);
+      if (url == null || url.isEmpty) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Не удалось загрузить трек")));
+        return;
+      }
+      final mediaItem = MediaItem(
+        id: url,
+        album: "",
+        title: track["title"]!,
+        artist: track["artist"]!,
+        artUri: Uri.parse(track["cover"]!),
+        extras: {'trackId': trackId},
+      );
+      await audioHandler.playNext(mediaItem);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Играет следующим")));
+      return;
+    } else if (result == "В конец очереди") {
+      final url = await yandexProvider.getDirectUrl(trackId);
+      if (url == null || url.isEmpty) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Не удалось загрузить трек")));
+        return;
+      }
+      final mediaItem = MediaItem(
+        id: url,
+        album: "",
+        title: track["title"]!,
+        artist: track["artist"]!,
+        artUri: Uri.parse(track["cover"]!),
+        extras: {'trackId': trackId},
+      );
+      await audioHandler.addToQueueEnd(mediaItem);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Добавлено в конец очереди")));
+      return;
+    } else if (result == "Добавить в избранное") {
       final success = await yandexProvider.likeTrack(trackId);
       if (success && mounted) {
         setState(() => track["isFavorite"] = "true");
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Добавлено в избранное")));
+        ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Добавлено в избранное")));
       }
     } else if (result == "Удалить из избранного") {
       final success = await yandexProvider.unlikeTrack(trackId);
       if (success && mounted) {
         setState(() => track["isFavorite"] = "false");
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Удалено из избранного")));
+        ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Удалено из избранного")));
       }
     } else if (result == "Закрепить в кэше") {
       final title = track["title"]!;
@@ -249,12 +327,14 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
       await yandexProvider.pinTrackWithMetadata(trackId, title, artist, cover);
       if (!mounted) return;
       setState(() => track["cached"] = "true");
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Трек закреплён в кэше")));
+      ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Трек закреплён в кэше")));
     } else if (result == "Удалить из кэша") {
-      yandexProvider.unpinTrack(trackId);
+      await yandexProvider.unpinTrack(trackId);
       if (!mounted) return;
       setState(() => track["cached"] = "false");
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Трек удалён из кэша")));
+      ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Трек удалён из кэша")));
     } else if (result == "Похожие треки") {
       final similar = await yandexProvider.getSimilarTracks(trackId);
       if (!mounted) return;
@@ -267,7 +347,8 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
         _showTracksDialog("Треки исполнителя: $artistName", artistTracks);
       } else {
         if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Не удалось найти исполнителя")));
+        ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Не удалось найти исполнителя")));
       }
     } else if (result == "Текст песни") {
       final lyrics = await yandexProvider.getLyrics(trackId);
@@ -277,13 +358,22 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
           context: context,
           builder: (context) => AlertDialog(
             backgroundColor: ArticTheme.backgroundDarkest,
-            title: Text(track["title"]!, style: TextStyle(color: ArticTheme.primary)),
-            content: SingleChildScrollView(child: Text(lyrics, style: TextStyle(color: ArticTheme.secondary))),
-            actions: [TextButton(onPressed: () => Navigator.pop(context), child: Text("Закрыть", style: TextStyle(color: ArticTheme.accent)))],
+            title: Text(track["title"]!,
+                style: TextStyle(color: ArticTheme.primary)),
+            content: SingleChildScrollView(
+                child: Text(lyrics,
+                    style: TextStyle(color: ArticTheme.secondary))),
+            actions: [
+              TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: Text("Закрыть",
+                      style: TextStyle(color: ArticTheme.accent)))
+            ],
           ),
         );
       } else {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Текст не найден")));
+        ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Текст не найден")));
       }
     }
   }
@@ -294,7 +384,8 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
     showModalBottomSheet(
       context: context,
       backgroundColor: ArticTheme.backgroundDarkest,
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
       builder: (context) => DraggableScrollableSheet(
         initialChildSize: 0.6,
         minChildSize: 0.4,
@@ -304,7 +395,11 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
           children: [
             Padding(
               padding: const EdgeInsets.all(kHorizontalPadding),
-              child: Text(title, style: TextStyle(color: ArticTheme.primary, fontSize: 20, fontWeight: FontWeight.bold)),
+              child: Text(title,
+                  style: TextStyle(
+                      color: ArticTheme.primary,
+                      fontSize: 20,
+                      fontWeight: FontWeight.bold)),
             ),
             Expanded(
               child: ListView.builder(
@@ -320,12 +415,17 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                         width: 40,
                         height: 40,
                         fit: BoxFit.cover,
-                        placeholder: (_, __) => Container(color: Colors.white10),
-                        errorWidget: (_, __, ___) => Container(color: Colors.white10, child: const Icon(Icons.music_note)),
+                        placeholder: (_, __) =>
+                            Container(color: Colors.white10),
+                        errorWidget: (_, __, ___) => Container(
+                            color: Colors.white10,
+                            child: const Icon(Icons.music_note)),
                       ),
                     ),
-                    title: Text(track["title"]!, style: TextStyle(color: ArticTheme.primary)),
-                    subtitle: Text(track["artist"]!, style: TextStyle(color: ArticTheme.secondary)),
+                    title: Text(track["title"]!,
+                        style: TextStyle(color: ArticTheme.primary)),
+                    subtitle: Text(track["artist"]!,
+                        style: TextStyle(color: ArticTheme.secondary)),
                     onTap: () async {
                       Navigator.pop(context);
                       await _playTracksFromDialog(tracks, i);
@@ -346,10 +446,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
     if (index >= tracksList.length) return;
 
     if (!mounted) return;
-    setState(() {
-      _isSwitchingTrack = true;
-      _loadingTrackIndex = index;
-    });
+    setState(() => _loadingTrackIndex = index);
 
     final List<Future<Map<String, dynamic>?>> futures = [];
     for (final track in tracksList) {
@@ -373,10 +470,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
 
     final results = await Future.wait(futures);
 
-    if (!mounted) {
-      setState(() => _isSwitchingTrack = false);
-      return;
-    }
+    if (!mounted) return;
 
     final itemsAll = <MediaItem>[];
     for (final result in results) {
@@ -392,8 +486,6 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
       }
     }
 
-    setState(() => _isSwitchingTrack = false);
-
     if (itemsAll.isEmpty) {
       setState(() => _loadingTrackIndex = null);
       ScaffoldMessenger.of(context).showSnackBar(
@@ -403,7 +495,8 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
     }
 
     final selectedTrackId = tracksList[index]['trackId']!;
-    int startIdx = itemsAll.indexWhere((item) => item.extras?['trackId'] == selectedTrackId);
+    int startIdx = itemsAll.indexWhere(
+        (item) => item.extras?['trackId'] == selectedTrackId);
     if (startIdx == -1) {
       setState(() => _loadingTrackIndex = null);
       ScaffoldMessenger.of(context).showSnackBar(
@@ -438,23 +531,19 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
     if (index >= cachedTracks.length) return;
 
     if (!mounted) return;
-    setState(() {
-      _isSwitchingTrack = true;
-      _loadingTrackIndex = index;
-    });
+    setState(() => _loadingTrackIndex = index);
 
     final trackData = cachedTracks[index];
     final trackUrl = trackData['url'];
     if (trackUrl == null || trackUrl.isEmpty) {
       if (!mounted) return;
-      setState(() {
-        _isSwitchingTrack = false;
-        _loadingTrackIndex = null;
-      });
+      setState(() => _loadingTrackIndex = null);
       return;
     }
 
-    final items = cachedTracks.where((t) => t['url'] != null && t['url']!.isNotEmpty).map((t) {
+    final items = cachedTracks
+        .where((t) => t['url'] != null && t['url']!.isNotEmpty)
+        .map((t) {
       return MediaItem(
         id: t['url']!,
         album: "",
@@ -464,9 +553,6 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
         extras: {'trackId': t['trackId']!},
       );
     }).toList();
-
-    if (!mounted) return;
-    setState(() => _isSwitchingTrack = false);
 
     final startIdx = items.indexWhere((item) => item.id == trackUrl);
     if (startIdx == -1) {
@@ -482,6 +568,8 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
       _showMiniPlayer = true;
       _loadingTrackIndex = null;
     });
+
+    _refreshDominantColor();
 
     try {
       await audioHandler.ready;
@@ -503,7 +591,8 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
         fullscreenDialog: true,
         transitionDuration: const Duration(milliseconds: 400),
         reverseTransitionDuration: const Duration(milliseconds: 400),
-        pageBuilder: (_, __, ___) => FullPlayerPage(initialDominantColor: _dominantColor),
+        pageBuilder: (_, __, ___) =>
+            FullPlayerPage(initialDominantColor: _dominantColor),
         transitionsBuilder: (_, anim, __, child) => SlideTransition(
           position: Tween<Offset>(begin: const Offset(0, 1), end: Offset.zero)
               .animate(CurvedAnimation(parent: anim, curve: Curves.easeOut)),
@@ -524,24 +613,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
 
   @override
   Widget build(BuildContext context) {
-    final screenWidth = MediaQuery.of(context).size.width;
     final bottomPadding = MediaQuery.of(context).padding.bottom;
-    final isPlaying = audioHandler.playbackState.value.playing;
-    final isLoading = yandexProvider.isLoading ||
-        audioHandler.playbackState.value.processingState == AudioProcessingState.loading ||
-        audioHandler.playbackState.value.processingState == AudioProcessingState.buffering;
-
-    final miniTrack = _currentMediaItem != null
-        ? {
-            'title': _currentMediaItem!.title,
-            'artist': _currentMediaItem!.artist ?? '',
-            'cover': _currentMediaItem!.artUri?.toString() ?? '',
-            'url': _currentMediaItem!.id,
-            'trackId': _currentMediaItem!.extras?['trackId'] as String? ?? '',
-          }
-        : (yandexProvider.tracks.isNotEmpty
-            ? yandexProvider.tracks[0]
-            : {"title": "Нет треков", "artist": "", "cover": "", "url": "", "trackId": ""});
 
     return Scaffold(
       backgroundColor: Colors.transparent,
@@ -550,7 +622,9 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
         child: Stack(
           children: [
             RepaintBoundary(
-              child: Container(decoration: BoxDecoration(gradient: ArticTheme.backgroundGradient)),
+              child: Container(
+                  decoration:
+                      BoxDecoration(gradient: ArticTheme.backgroundGradient)),
             ),
             const RepaintBoundary(
               child: MatrixBackground(opacity: 0.009, numberOfDrops: 25),
@@ -575,7 +649,8 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                 SafeArea(
                   bottom: false,
                   child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: kHorizontalPadding, vertical: 8),
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: kHorizontalPadding, vertical: 8),
                     child: Row(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
@@ -600,13 +675,18 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                     ),
                   ),
                 ),
+                if (!yandexProvider.hasInternet) const _OfflineBanner(),
                 Expanded(
                   child: PageView(
                     controller: _pageController,
                     physics: const ClampingScrollPhysics(),
                     onPageChanged: (index) {
                       setState(() => _currentTab = index);
-                      if (index == 0 && DateTime.now().difference(_lastLibraryUpdate).inSeconds > 30) {
+                      if (index == 0 &&
+                          DateTime.now()
+                                  .difference(_lastLibraryUpdate)
+                                  .inSeconds >
+                              30) {
                         _refreshFavorites();
                       }
                     },
@@ -634,17 +714,10 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                           });
                         },
                         onLongPressTrack: _showTrackOptions,
-                        onRequestSwitchStart: () {
-                          setState(() {
-                            _isSwitchingTrack = true;
-                          });
-                        },
-                        onRequestSwitchEnd: () {
-                          setState(() {
-                            _isSwitchingTrack = false;
-                          });
-                        },
-                        currentTrackId: _currentMediaItem?.extras?['trackId'] as String?,
+                        onRequestSwitchStart: () {},
+                        onRequestSwitchEnd: () {},
+                        currentTrackId:
+                            _currentMediaItem?.extras?['trackId'] as String?,
                       ),
                       const _SettingsContent(),
                     ],
@@ -652,23 +725,48 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                 ),
               ],
             ),
-            if (_showMiniPlayer && miniTrack["title"] != "Нет треков")
+            if (_showMiniPlayer && _currentMediaItem != null)
               Positioned(
                 left: kHorizontalPadding,
                 right: kHorizontalPadding,
                 bottom: 8 + bottomPadding,
-                child: _MiniPlayer(
-                  track: miniTrack,
-                  onTap: _openFullPlayer,
-                  onPlayPause: _playPause,
-                  onNext: _nextTrack,
-                  onPrevious: _previousTrack,
-                  isPlaying: isPlaying,
-                  isLoading: isLoading || _loadingTrackIndex != null,
-                ).animate().fadeIn(duration: 300.ms).slideY(begin: 0.2, end: 0),
+                child: const _MiniPlayerHost()
+                    .animate()
+                    .fadeIn(duration: 300.ms)
+                    .slideY(begin: 0.2, end: 0),
               ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+// ========== БАННЕР ОФЛАЙН ==========
+class _OfflineBanner extends StatelessWidget {
+  const _OfflineBanner();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.symmetric(
+          horizontal: kHorizontalPadding, vertical: 4),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: ArticTheme.accent.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: ArticTheme.accent.withValues(alpha: 0.35)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.cloud_off, size: 14, color: ArticTheme.accent),
+          const SizedBox(width: 6),
+          Text(
+            'Офлайн — доступны только сохранённые треки',
+            style: TextStyle(color: ArticTheme.accent, fontSize: 11),
+          ),
+        ],
       ),
     );
   }
@@ -694,13 +792,17 @@ class _TabButton extends StatelessWidget {
         duration: const Duration(milliseconds: 300),
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
         decoration: BoxDecoration(
-          color: isActive ? ArticTheme.accent.withValues(alpha: 0.15) : Colors.transparent,
+          color: isActive
+              ? ArticTheme.accent.withValues(alpha: 0.15)
+              : Colors.transparent,
           borderRadius: BorderRadius.circular(24),
         ),
         child: Text(
           label,
           style: TextStyle(
-            color: isActive ? ArticTheme.accent : ArticTheme.primary.withValues(alpha: 0.6),
+            color: isActive
+                ? ArticTheme.accent
+                : ArticTheme.primary.withValues(alpha: 0.6),
             fontSize: 14,
             fontWeight: isActive ? FontWeight.w600 : FontWeight.normal,
           ),

@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:audio_service/audio_service.dart';
@@ -5,6 +7,8 @@ import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'screens/main_screen.dart';
 import 'services/audio_handler.dart';
+import 'services/database/app_database.dart';
+import 'services/database/queue_repository.dart';
 import 'services/yandex/yandex_auth_service.dart';
 import 'services/yandex/yandex_audio_provider.dart';
 import 'screens/yandex_token_input_screen.dart';
@@ -16,6 +20,7 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   ErrorWidget.builder = (FlutterErrorDetails details) {
+    debugPrint('ErrorWidget: ${details.exception}');
     return Scaffold(
       backgroundColor: ArticTheme.backgroundDeep,
       body: Center(
@@ -25,14 +30,17 @@ void main() async {
             Icon(Icons.error_outline, color: ArticTheme.accent, size: 64),
             const SizedBox(height: 16),
             Text(
-              'Произошла ошибка',
+              'Что-то пошло не так',
               style: TextStyle(color: ArticTheme.primary, fontSize: 18),
             ),
             const SizedBox(height: 8),
-            Text(
-              details.exception.toString(),
-              style: TextStyle(color: ArticTheme.secondary, fontSize: 12),
-              textAlign: TextAlign.center,
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24),
+              child: Text(
+                'Попробуйте перезапустить приложение',
+                style: TextStyle(color: ArticTheme.secondary, fontSize: 12),
+                textAlign: TextAlign.center,
+              ),
             ),
           ],
         ),
@@ -53,7 +61,14 @@ void main() async {
 
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
 
+  // SQLite должна быть готова до CacheManager / HistoryStore / AudioHandler
+  await AppDatabase.instance.init();
+
   final prefs = await SharedPreferences.getInstance();
+
+  // Миграция очереди из prefs в БД (один раз, до создания handler'а).
+  await _migrateQueueIfNeeded(prefs);
+
   final audioHandler = AppAudioHandler(prefs: prefs);
 
   await AudioService.init(
@@ -66,17 +81,31 @@ void main() async {
     ),
   );
 
-  try {
-    await audioHandler.setTracksAndPlay([], 0);
-    await Future.delayed(const Duration(milliseconds: 100));
-  } catch (e) {
-    debugPrint('Warmup error: $e');
-  }
+  // Детерминированная инициализация вместо setTracksAndPlay([], 0)
+  await audioHandler.initialize();
 
   final yandexAuth = YandexAuthService();
 
   final themeNotifier = ThemeNotifier();
   await themeNotifier.loadTheme();
+
+  // Создаём провайдер заранее — нужно связать его с audioHandler
+  final yandexProvider = YandexAudioProvider(yandexAuth);
+
+  // Связка: когда трек стартует — preload следующего + запись в историю
+  audioHandler.onTrackStarted = (currentItem, nextTrackId) {
+    yandexProvider.preloadNextTrack(nextTrackId);
+
+    final trackId = currentItem.extras?['trackId'] as String?;
+    if (trackId != null && trackId.isNotEmpty) {
+      yandexProvider.scheduleHistoryAdd(
+        trackId: trackId,
+        title: currentItem.title,
+        artist: currentItem.artist ?? '',
+        cover: currentItem.artUri?.toString() ?? '',
+      );
+    }
+  };
 
   final lifecycleObserver = _AppLifecycleObserver(audioHandler);
   WidgetsBinding.instance.addObserver(lifecycleObserver);
@@ -86,12 +115,49 @@ void main() async {
       providers: [
         Provider<AppAudioHandler>.value(value: audioHandler),
         Provider<YandexAuthService>.value(value: yandexAuth),
-        ChangeNotifierProvider(create: (_) => YandexAudioProvider(yandexAuth)),
+        ChangeNotifierProvider<YandexAudioProvider>.value(value: yandexProvider),
         ChangeNotifierProvider<ThemeNotifier>.value(value: themeNotifier),
       ],
       child: const ArticMuzikApp(),
     ),
   );
+}
+
+/// Одноразовая миграция очереди из SharedPreferences в SQLite.
+/// Выполняется ДО создания AppAudioHandler, чтобы не конфликтовать
+/// с инициализацией платформенных стримов.
+Future<void> _migrateQueueIfNeeded(SharedPreferences prefs) async {
+  final repo = QueueRepository();
+
+  // Если в БД уже что-то есть — миграция не нужна
+  final existing = await repo.load();
+  if (existing != null && existing.queueJson.isNotEmpty) {
+    // На всякий случай чистим legacy ключи, если они ещё лежат
+    if (prefs.containsKey('queue_items')) {
+      await prefs.remove('queue_items');
+      await prefs.remove('queue_index');
+      await prefs.remove('position_ms');
+    }
+    return;
+  }
+
+  final legacyList = prefs.getStringList('queue_items');
+  if (legacyList == null || legacyList.isEmpty) return;
+
+  final queueJson = json.encode(legacyList);
+  final savedIndex = prefs.getInt('queue_index') ?? 0;
+  final savedPositionMs = prefs.getInt('position_ms') ?? 0;
+
+  await repo.save(
+    queueJson: queueJson,
+    currentIndex: savedIndex,
+    positionMs: savedPositionMs,
+  );
+
+  await prefs.remove('queue_items');
+  await prefs.remove('queue_index');
+  await prefs.remove('position_ms');
+  debugPrint('Queue migration: migrated from prefs');
 }
 
 class _AppLifecycleObserver extends WidgetsBindingObserver {
@@ -111,8 +177,6 @@ class ArticMuzikApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final themeNotifier = Provider.of<ThemeNotifier>(context);
-
     return MaterialApp(
       title: 'ArticMuzik',
       debugShowCheckedModeBanner: false,
@@ -122,9 +186,7 @@ class ArticMuzikApp extends StatelessWidget {
         useMaterial3: true,
         fontFamily: 'StieglitzSP',
       ),
-      // Сплеш теперь отвечает за навигацию, поэтому home всегда SplashScreen
       home: const SplashScreen(),
-      // Маршруты оставляем для возможного использования, но сплеш сам управляет переходом
       routes: {
         '/token': (context) => const YandexTokenInputScreen(),
         '/main': (context) => const MainScreen(),

@@ -7,7 +7,8 @@ class _SettingsContent extends StatefulWidget {
   State<_SettingsContent> createState() => __SettingsContentState();
 }
 
-class __SettingsContentState extends State<_SettingsContent> with AutomaticKeepAliveClientMixin {
+class __SettingsContentState extends State<_SettingsContent>
+    with AutomaticKeepAliveClientMixin {
   bool _hapticEnabled = true;
   AppTheme _currentTheme = AppTheme.defaultTheme;
 
@@ -30,10 +31,14 @@ class __SettingsContentState extends State<_SettingsContent> with AutomaticKeepA
 
   AppTheme _parseTheme(String name) {
     switch (name) {
-      case 'darkCrimson': return AppTheme.darkCrimson;
-      case 'neonCyber': return AppTheme.neonCyber;
-      case 'matrixGreen': return AppTheme.matrixGreen;
-      default: return AppTheme.defaultTheme;
+      case 'darkCrimson':
+        return AppTheme.darkCrimson;
+      case 'neonCyber':
+        return AppTheme.neonCyber;
+      case 'matrixGreen':
+        return AppTheme.matrixGreen;
+      default:
+        return AppTheme.defaultTheme;
     }
   }
 
@@ -42,7 +47,8 @@ class __SettingsContentState extends State<_SettingsContent> with AutomaticKeepA
     notifier.applyTheme(theme);
     setState(() => _currentTheme = theme);
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Тема изменена'), duration: Duration(seconds: 1)),
+      const SnackBar(
+          content: Text('Тема изменена'), duration: Duration(seconds: 1)),
     );
   }
 
@@ -52,17 +58,42 @@ class __SettingsContentState extends State<_SettingsContent> with AutomaticKeepA
     if (mounted) Navigator.pushReplacementNamed(context, '/token');
   }
 
+  void _openStorage() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const StorageManagerScreen()),
+    );
+  }
+
+  void _openDownloads() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const DownloadsScreen()),
+    );
+  }
+
+  void _openHistory() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const HistoryScreen()),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     super.build(context);
     final screenWidth = MediaQuery.of(context).size.width;
-    return Container(
+    return SingleChildScrollView(
       padding: EdgeInsets.all(screenWidth * 0.06),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const SizedBox(height: 12),
-          Text("Настройки", style: TextStyle(fontSize: 24, fontWeight: FontWeight.w600, color: ArticTheme.primary)),
+          Text("Настройки",
+              style: TextStyle(
+                  fontSize: 24,
+                  fontWeight: FontWeight.w600,
+                  color: ArticTheme.primary)),
           const SizedBox(height: 24),
           _buildTile(
             title: "Тактильная отдача",
@@ -76,6 +107,27 @@ class __SettingsContentState extends State<_SettingsContent> with AutomaticKeepA
           ),
           _buildThemeSelector(),
           _buildTile(
+            title: "Хранилище",
+            subtitle: "Управление кэшем и закреплёнными треками",
+            icon: Icons.storage,
+            iconColor: ArticTheme.accent,
+            onTap: _openStorage,
+          ),
+          _buildTile(
+            title: "Загрузки",
+            subtitle: "Активные и завершённые загрузки",
+            icon: Icons.download,
+            iconColor: ArticTheme.accent,
+            onTap: _openDownloads,
+          ),
+          _buildTile(
+            title: "История",
+            subtitle: "Недавно прослушанные треки",
+            icon: Icons.history,
+            iconColor: ArticTheme.accent,
+            onTap: _openHistory,
+          ),
+          _buildTile(
             title: "Выйти из Яндекс.Музыки",
             subtitle: "Сбросить токен и выйти из аккаунта",
             icon: Icons.logout,
@@ -84,14 +136,15 @@ class __SettingsContentState extends State<_SettingsContent> with AutomaticKeepA
           ),
           _buildTile(
             title: "О приложении",
-            subtitle: "ArticMuzik 3.0 с Яндекс.Музыкой",
+            subtitle: "ArticMuzik 0.1.0",
             icon: Icons.info_outline,
             iconColor: ArticTheme.accent,
             onTap: () => showDialog(
               context: context,
               builder: (_) => AlertDialog(
                 backgroundColor: ArticTheme.backgroundDarkest,
-                title: Text("ArticMuzik", style: TextStyle(color: ArticTheme.primary)),
+                title:
+                    Text("ArticMuzik", style: TextStyle(color: ArticTheme.primary)),
                 content: Text(
                   "Минималистичный музыкальный плеер с поддержкой Яндекс.Музыки.",
                   style: TextStyle(color: ArticTheme.secondary),
@@ -99,12 +152,14 @@ class __SettingsContentState extends State<_SettingsContent> with AutomaticKeepA
                 actions: [
                   TextButton(
                     onPressed: () => Navigator.pop(context),
-                    child: Text("Закрыть", style: TextStyle(color: ArticTheme.accent)),
+                    child: Text("Закрыть",
+                        style: TextStyle(color: ArticTheme.accent)),
                   )
                 ],
               ),
             ),
           ),
+          const SizedBox(height: 24),
         ],
       ),
     );
@@ -116,7 +171,9 @@ class __SettingsContentState extends State<_SettingsContent> with AutomaticKeepA
       children: [
         Padding(
           padding: const EdgeInsets.only(left: 8, bottom: 8),
-          child: Text("Оформление", style: TextStyle(color: ArticTheme.primary, fontWeight: FontWeight.w500)),
+          child: Text("Оформление",
+              style: TextStyle(
+                  color: ArticTheme.primary, fontWeight: FontWeight.w500)),
         ),
         Wrap(
           spacing: 12,
@@ -178,9 +235,14 @@ class __SettingsContentState extends State<_SettingsContent> with AutomaticKeepA
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(title, style: TextStyle(color: ArticTheme.primary, fontWeight: FontWeight.w500)),
+                  Text(title,
+                      style: TextStyle(
+                          color: ArticTheme.primary,
+                          fontWeight: FontWeight.w500)),
                   const SizedBox(height: 4),
-                  Text(subtitle, style: TextStyle(color: ArticTheme.secondary, fontSize: 12)),
+                  Text(subtitle,
+                      style: TextStyle(
+                          color: ArticTheme.secondary, fontSize: 12)),
                 ],
               ),
             ),
@@ -214,7 +276,8 @@ class _ThemeChip extends StatelessWidget {
       backgroundColor: ArticTheme.backgroundDarkest.withValues(alpha: 0.6),
       selectedColor: ArticTheme.accent,
       checkmarkColor: ArticTheme.primary,
-      labelStyle: TextStyle(color: isSelected ? ArticTheme.primary : ArticTheme.secondary),
+      labelStyle: TextStyle(
+          color: isSelected ? ArticTheme.primary : ArticTheme.secondary),
     );
   }
 }
