@@ -16,13 +16,13 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
   Timer? _saveDebounceTimer;
   bool _isInitialized = false;
   bool _disposed = false;
+  bool _isSkipping = false;
 
   final Set<String> _brokenTrackIds = {};
   DateTime? _lastSwitchAt;
 
-  /// Сериализация всех операций управления плеером.
-  /// Гарантирует, что второй skipToNext не начнётся до завершения первого.
-  Future<void> _opChain = Future.value();
+  StreamSubscription<PlayerState>? _playerStateSub;
+  StreamSubscription<Duration?>? _durationSub;
 
   void Function(MediaItem current, String? nextTrackId)? onTrackStarted;
 
@@ -38,33 +38,14 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
     _setupListeners();
   }
 
-  /// Обёртка над операцией: кладёт её в конец цепочки.
-  /// Возвращает Future, который зарезолвится, когда операция отработает.
-  Future<T> _queueOp<T>(Future<T> Function() op) {
-    final completer = Completer<T>();
-    _opChain = _opChain.then((_) async {
-      if (_disposed) {
-        if (!completer.isCompleted) {
-          completer.completeError(StateError('Handler disposed'));
-        }
-        return;
-      }
-      try {
-        final r = await op();
-        if (!completer.isCompleted) completer.complete(r);
-      } catch (e, st) {
-        if (!completer.isCompleted) completer.completeError(e, st);
-      }
-    });
-    return completer.future;
-  }
-
   Future<void> initialize() async {
     if (_isInitialized) return;
     try {
       await _restoreState();
       if (_player.audioSource == null) {
-        await _player.setAudioSource(ConcatenatingAudioSource(children: []));
+        await _player
+            .setAudioSource(ConcatenatingAudioSource(children: []))
+            .timeout(const Duration(seconds: 10));
       }
     } catch (e) {
       debugPrint('AudioHandler.initialize error: $e');
@@ -77,15 +58,15 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
   void _setupListeners() {
     _player.playbackEventStream.map(_transformEvent).pipe(playbackState);
 
-    _player.playerStateStream.listen((state) {
+    _playerStateSub = _player.playerStateStream.listen((state) {
       if (_disposed) return;
       if (!_isInitialized) return;
       if (state.processingState == ProcessingState.completed) {
-        _queueOp(() => _handleTrackCompleted());
+        _handleTrackCompleted();
       }
     });
 
-    _player.durationStream.listen((d) {
+    _durationSub = _player.durationStream.listen((d) {
       if (_disposed || d == null) return;
       final idx = _player.currentIndex;
       if (idx == null || idx >= queue.value.length) return;
@@ -104,7 +85,6 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
     if (_lastSwitchAt != null &&
         DateTime.now().difference(_lastSwitchAt!) <
             const Duration(milliseconds: 1200)) {
-      debugPrint('Ignoring stale completed event');
       return;
     }
 
@@ -121,39 +101,49 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
   }
 
   Future<void> _safeSkipToNext() async {
-    final currentIndex = _player.currentIndex ?? 0;
-    final nextIndex = currentIndex + 1;
+    if (_isSkipping) return;
+    _isSkipping = true;
+    try {
+      final currentIndex = _player.currentIndex ?? 0;
+      final nextIndex = currentIndex + 1;
 
-    if (nextIndex >= queue.value.length) {
-      if (_player.loopMode == LoopMode.all && queue.value.isNotEmpty) {
-        await _tryPlayIndex(0);
-      } else {
-        await _stopInternal();
+      if (nextIndex >= queue.value.length) {
+        if (_player.loopMode == LoopMode.all && queue.value.isNotEmpty) {
+          await _tryPlayIndex(0);
+        } else {
+          await _stopInternal();
+        }
+        return;
       }
-      return;
+      await _tryPlayIndex(nextIndex);
+    } finally {
+      _isSkipping = false;
     }
-
-    await _tryPlayIndex(nextIndex);
   }
 
   Future<void> _safeSkipToPrevious() async {
-    final currentIndex = _player.currentIndex ?? 0;
-    final prevIndex = currentIndex - 1;
+    if (_isSkipping) return;
+    _isSkipping = true;
+    try {
+      final currentIndex = _player.currentIndex ?? 0;
+      final prevIndex = currentIndex - 1;
 
-    if (prevIndex < 0) {
-      if (_player.loopMode == LoopMode.all && queue.value.isNotEmpty) {
-        await _tryPlayIndex(queue.value.length - 1);
-      } else {
-        try {
-          await _player.seek(Duration.zero);
-        } catch (e) {
-          debugPrint('Seek to zero error: $e');
+      if (prevIndex < 0) {
+        if (_player.loopMode == LoopMode.all && queue.value.isNotEmpty) {
+          await _tryPlayIndex(queue.value.length - 1);
+        } else {
+          try {
+            await _player.seek(Duration.zero);
+          } catch (e) {
+            debugPrint('Seek to zero error: $e');
+          }
         }
+        return;
       }
-      return;
+      await _tryPlayIndex(prevIndex);
+    } finally {
+      _isSkipping = false;
     }
-
-    await _tryPlayIndex(prevIndex);
   }
 
   Future<void> _tryPlayIndex(int index) async {
@@ -184,7 +174,7 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
           : null;
       onTrackStarted?.call(item, nextTrackId);
 
-      await saveCurrentState();
+      saveCurrentState();
     } catch (e) {
       debugPrint('Playback error at index $index ($trackId): $e');
       if (trackId != null) _brokenTrackIds.add(trackId);
@@ -271,10 +261,12 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
     if (targetIndex >= validItems.length) targetIndex = 0;
 
     try {
-      await _player.setAudioSource(
-        ConcatenatingAudioSource(children: validSources),
-        initialIndex: targetIndex,
-      );
+      await _player
+          .setAudioSource(
+            ConcatenatingAudioSource(children: validSources),
+            initialIndex: targetIndex,
+          )
+          .timeout(const Duration(seconds: 10));
 
       try {
         queue.add(validItems);
@@ -391,154 +383,135 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
 
   LoopMode getLoopMode() => _player.loopMode;
 
-  // ---------- ОЧЕРЕДЬ: манипуляции ----------
+  // ---------- ОЧЕРЕДЬ ----------
 
-  bool get _canModifyQueue =>
-      _player.audioSource is ConcatenatingAudioSource;
+  bool get _canModifyQueue => _player.audioSource is ConcatenatingAudioSource;
 
-  Future<void> removeFromQueue(int index) {
-    return _queueOp(() async {
-      if (!_canModifyQueue) return;
-      if (index < 0 || index >= queue.value.length) return;
+  Future<void> removeFromQueue(int index) async {
+    if (!_canModifyQueue) return;
+    if (index < 0 || index >= queue.value.length) return;
 
-      final source = _player.audioSource as ConcatenatingAudioSource;
-      final wasCurrent = _player.currentIndex == index;
+    final source = _player.audioSource as ConcatenatingAudioSource;
+    final wasCurrent = _player.currentIndex == index;
 
-      try {
-        await source.removeAt(index);
+    try {
+      await source.removeAt(index);
 
-        final updatedItems = queue.value.toList()..removeAt(index);
-        queue.add(updatedItems);
+      final updatedItems = queue.value.toList()..removeAt(index);
+      queue.add(updatedItems);
 
-        if (wasCurrent) {
-          int newIndex;
-          if (index < updatedItems.length) {
-            newIndex = index;
-          } else if (updatedItems.isNotEmpty) {
-            newIndex = updatedItems.length - 1;
-          } else {
-            await _stopInternal();
-            return;
-          }
-          await _tryPlayIndex(newIndex);
-        } else if (updatedItems.isEmpty) {
-          await _stopInternal();
+      if (wasCurrent) {
+        int newIndex;
+        if (index < updatedItems.length) {
+          newIndex = index;
+        } else if (updatedItems.isNotEmpty) {
+          newIndex = updatedItems.length - 1;
         } else {
-          await saveCurrentState();
+          await _stopInternal();
+          return;
         }
-      } catch (e) {
-        debugPrint('removeFromQueue error: $e');
+        await _tryPlayIndex(newIndex);
+      } else if (updatedItems.isEmpty) {
+        await _stopInternal();
       }
-    });
+    } catch (e) {
+      debugPrint('removeFromQueue error: $e');
+    }
   }
 
-  Future<void> moveInQueue(int oldIndex, int newIndex) {
-    return _queueOp(() async {
-      if (!_canModifyQueue) return;
-      if (oldIndex < 0 || oldIndex >= queue.value.length) return;
-      if (newIndex < 0 || newIndex > queue.value.length) return;
-      if (oldIndex == newIndex) return;
+  Future<void> moveInQueue(int oldIndex, int newIndex) async {
+    if (!_canModifyQueue) return;
+    if (oldIndex < 0 || oldIndex >= queue.value.length) return;
+    if (newIndex < 0 || newIndex > queue.value.length) return;
+    if (oldIndex == newIndex) return;
 
-      int adjustedNew = newIndex;
-      if (newIndex > oldIndex) adjustedNew -= 1;
+    int adjustedNew = newIndex;
+    if (newIndex > oldIndex) adjustedNew -= 1;
 
-      final source = _player.audioSource as ConcatenatingAudioSource;
-      final currentIdx = _player.currentIndex;
+    final source = _player.audioSource as ConcatenatingAudioSource;
+    final currentIdx = _player.currentIndex;
 
-      try {
-        await source.move(oldIndex, adjustedNew);
+    try {
+      await source.move(oldIndex, adjustedNew);
 
-        final updated = queue.value.toList();
-        final moved = updated.removeAt(oldIndex);
-        updated.insert(adjustedNew, moved);
-        queue.add(updated);
+      final updated = queue.value.toList();
+      final moved = updated.removeAt(oldIndex);
+      updated.insert(adjustedNew, moved);
+      queue.add(updated);
 
-        if (currentIdx == oldIndex) {
-          mediaItem.add(moved);
-        }
-
-        await saveCurrentState();
-      } catch (e) {
-        debugPrint('moveInQueue error: $e');
+      if (currentIdx == oldIndex) {
+        mediaItem.add(moved);
       }
-    });
+    } catch (e) {
+      debugPrint('moveInQueue error: $e');
+    }
   }
 
-  Future<void> playNext(MediaItem item) {
-    return _queueOp(() async {
-      final source = _player.audioSource;
+  Future<void> playNext(MediaItem item) async {
+    final source = _player.audioSource;
 
-      if (source is! ConcatenatingAudioSource || queue.value.isEmpty) {
-        await _setTracksAndPlayInternal([item], 0);
-        return;
-      }
+    if (source is! ConcatenatingAudioSource || queue.value.isEmpty) {
+      await _setTracksAndPlayInternal([item], 0);
+      return;
+    }
 
-      final currentIdx = _player.currentIndex ?? 0;
-      final insertAt = currentIdx + 1;
+    final currentIdx = _player.currentIndex ?? 0;
+    final insertAt = currentIdx + 1;
 
-      final newSource = item.id.startsWith('http://') ||
-              item.id.startsWith('https://')
-          ? AudioSource.uri(Uri.parse(item.id))
-          : AudioSource.file(item.id);
+    final newSource = item.id.startsWith('http://') ||
+            item.id.startsWith('https://')
+        ? AudioSource.uri(Uri.parse(item.id))
+        : AudioSource.file(item.id);
 
-      try {
-        await source.insert(insertAt, newSource);
+    try {
+      await source.insert(insertAt, newSource);
 
-        final updated = queue.value.toList();
-        updated.insert(insertAt, item);
-        queue.add(updated);
-
-        await saveCurrentState();
-      } catch (e) {
-        debugPrint('playNext error: $e');
-      }
-    });
+      final updated = queue.value.toList();
+      updated.insert(insertAt, item);
+      queue.add(updated);
+    } catch (e) {
+      debugPrint('playNext error: $e');
+    }
   }
 
-  Future<void> addToQueueEnd(MediaItem item) {
-    return _queueOp(() async {
-      final source = _player.audioSource;
+  Future<void> addToQueueEnd(MediaItem item) async {
+    final source = _player.audioSource;
 
-      if (source is! ConcatenatingAudioSource || queue.value.isEmpty) {
-        await _setTracksAndPlayInternal([item], 0);
-        return;
-      }
+    if (source is! ConcatenatingAudioSource || queue.value.isEmpty) {
+      await _setTracksAndPlayInternal([item], 0);
+      return;
+    }
 
-      final newSource = item.id.startsWith('http://') ||
-              item.id.startsWith('https://')
-          ? AudioSource.uri(Uri.parse(item.id))
-          : AudioSource.file(item.id);
+    final newSource = item.id.startsWith('http://') ||
+            item.id.startsWith('https://')
+        ? AudioSource.uri(Uri.parse(item.id))
+        : AudioSource.file(item.id);
 
-      try {
-        await source.add(newSource);
+    try {
+      await source.add(newSource);
 
-        final updated = queue.value.toList()..add(item);
-        queue.add(updated);
-
-        await saveCurrentState();
-      } catch (e) {
-        debugPrint('addToQueueEnd error: $e');
-      }
-    });
+      final updated = queue.value.toList()..add(item);
+      queue.add(updated);
+    } catch (e) {
+      debugPrint('addToQueueEnd error: $e');
+    }
   }
 
-  Future<void> clearQueue() {
-    return _queueOp(() async {
-      await _stopInternal();
-      try {
-        await _player.setAudioSource(ConcatenatingAudioSource(children: []));
-      } catch (_) {}
-      queue.add([]);
-      mediaItem.add(null);
-      _brokenTrackIds.clear();
-      await _queueRepo.clear();
-    });
+  Future<void> clearQueue() async {
+    await _stopInternal();
+    try {
+      await _player.setAudioSource(ConcatenatingAudioSource(children: []));
+    } catch (_) {}
+    queue.add([]);
+    mediaItem.add(null);
+    _brokenTrackIds.clear();
+    await _queueRepo.clear();
   }
 
   // ---------- Основной API ----------
 
   Future<void> setTracksAndPlay(List<MediaItem> items, int startIndex) {
-    return _queueOp(() => _setTracksAndPlayInternal(items, startIndex));
+    return _setTracksAndPlayInternal(items, startIndex);
   }
 
   Future<void> _setTracksAndPlayInternal(
@@ -547,6 +520,7 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
     if (_disposed) return;
 
     _brokenTrackIds.clear();
+    debugPrint('setTracksAndPlay: ${items.length} items, start=$startIndex');
 
     if (_player.playing) {
       try {
@@ -566,10 +540,12 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
     }).toList();
 
     try {
-      await _player.setAudioSource(
-        ConcatenatingAudioSource(children: sources),
-        initialIndex: startIndex,
-      );
+      await _player
+          .setAudioSource(
+            ConcatenatingAudioSource(children: sources),
+            initialIndex: startIndex,
+          )
+          .timeout(const Duration(seconds: 30));
 
       try {
         queue.add(items);
@@ -582,7 +558,6 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
       }
 
       _lastSwitchAt = DateTime.now();
-
       await _player.play();
 
       if (startIndex < items.length) {
@@ -593,112 +568,69 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
         onTrackStarted?.call(items[startIndex], nextTrackId);
       }
 
-      await saveCurrentState();
-
-      if (_player.duration != null && _player.duration! > Duration.zero) {
-        final idx = _player.currentIndex;
-        if (idx != null && idx < queue.value.length) {
-          final updated = queue.value[idx].copyWith(duration: _player.duration);
-          queue.value[idx] = updated;
-          mediaItem.add(updated);
-        }
-      }
+      saveCurrentState();
     } catch (e) {
       debugPrint('setTracksAndPlay error: $e');
-      try {
-        await _player.stop();
-        await _player.setAudioSource(ConcatenatingAudioSource(children: []));
-        await Future.delayed(const Duration(milliseconds: 300));
-        await _player.setAudioSource(
-          ConcatenatingAudioSource(children: sources),
-          initialIndex: startIndex,
-        );
-        _lastSwitchAt = DateTime.now();
-        await _player.play();
-
-        if (startIndex < items.length) {
-          final nextIndex = startIndex + 1;
-          final nextTrackId = nextIndex < items.length
-              ? (items[nextIndex].extras?['trackId'] as String?)
-              : null;
-          onTrackStarted?.call(items[startIndex], nextTrackId);
-        }
-
-        debugPrint('setTracksAndPlay recovered');
-      } catch (e2) {
-        debugPrint('setTracksAndPlay recovery failed: $e2');
-        rethrow;
-      }
     }
   }
 
   @override
-  Future<void> play() {
-    return _queueOp(() async {
-      try {
-        await _player.play();
-        await saveCurrentState();
-      } catch (e) {
-        debugPrint('play error: $e');
-      }
-    });
+  Future<void> play() async {
+    try {
+      await _player.play();
+      saveCurrentState();
+    } catch (e) {
+      debugPrint('play error: $e');
+    }
   }
 
   @override
-  Future<void> pause() {
-    return _queueOp(() async {
-      try {
+  Future<void> pause() async {
+    try {
+      await _player.pause();
+      saveCurrentState();
+    } catch (e) {
+      debugPrint('pause error: $e');
+    }
+  }
+
+  Future<void> playOrPause() async {
+    try {
+      if (_player.playing) {
         await _player.pause();
-        await saveCurrentState();
-      } catch (e) {
-        debugPrint('pause error: $e');
+      } else {
+        await _player.play();
       }
-    });
-  }
-
-  Future<void> playOrPause() {
-    return _queueOp(() async {
-      try {
-        if (_player.playing) {
-          await _player.pause();
-        } else {
-          await _player.play();
-        }
-        await saveCurrentState();
-      } catch (e) {
-        debugPrint('playOrPause error: $e');
-      }
-    });
+      saveCurrentState();
+    } catch (e) {
+      debugPrint('playOrPause error: $e');
+    }
   }
 
   @override
-  Future<void> seek(Duration position) {
-    return _queueOp(() async {
-      try {
-        await _player.seek(position);
-        await saveCurrentState();
-      } catch (e) {
-        debugPrint('seek error: $e');
-      }
-    });
+  Future<void> seek(Duration position) async {
+    try {
+      await _player.seek(position);
+      saveCurrentState();
+    } catch (e) {
+      debugPrint('seek error: $e');
+    }
   }
 
   @override
-  Future<void> skipToQueueItem(int index) {
-    return _queueOp(() async {
-      if (index < 0 || index >= queue.value.length) return;
-      await _tryPlayIndex(index);
-    });
+  Future<void> skipToQueueItem(int index) async {
+    if (index < 0 || index >= queue.value.length) return;
+    await _tryPlayIndex(index);
   }
 
   @override
-  Future<void> skipToNext() {
-    return _queueOp(() => _safeSkipToNext());
+  Future<void> skipToNext() async {
+    await _safeSkipToNext();
   }
 
   @override
-  Future<void> skipToPrevious() {
-    return _queueOp(() => _safeSkipToPrevious());
+  Future<void> skipToPrevious() async {
+    await _safeSkipToPrevious();
   }
 
   Future<void> _stopInternal() async {
@@ -716,8 +648,8 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
   }
 
   @override
-  Future<void> stop() {
-    return _queueOp(() => _stopInternal());
+  Future<void> stop() async {
+    await _stopInternal();
   }
 
   @override
@@ -729,6 +661,9 @@ class AppAudioHandler extends BaseAudioHandler with QueueHandler {
   void dispose() {
     _disposed = true;
     _saveDebounceTimer?.cancel();
+    _playerStateSub?.cancel();
+    _durationSub?.cancel();
+    if (!_readyCompleter.isCompleted) _readyCompleter.complete();
     _player.dispose();
   }
 }
